@@ -1,0 +1,20 @@
+# 环境变量（含敏感信息）
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 输出文件（每次运行生成，无需版本控制）
+output/
+
+# 历史评分数据
+ss_score_history.json
+
+# WorkBuddy 内部文件
+.workbuddy/
+
+# 系统文件
+.DS_Store
+Thumbs.db
