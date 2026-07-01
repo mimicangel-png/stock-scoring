@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 SS-Enhanced 评分引擎 + 邮件报告
-策略: ≥75强烈买入, ≥70逢低买入, ≥60持有, ≥45观望, <45回避, <40连续3天强制卖出
+策略: ≥75强烈买入 · ≥70逢低买入 · ≥60持有 · ≥45观望 · <45回避 · <40触发卖出
 """
 import json, math, urllib.request, sys, os
 from datetime import datetime, timedelta
@@ -58,13 +58,415 @@ def fetch_extra_info(codes):
                     "change_pct":float(vals[32]) if vals[32] else 0,
                     "pe_ttm":float(vals[39]) if vals[39] else 0,
                     "pb":float(vals[46]) if vals[46] else 0,
-                    "mcap":float(vals[44]) if vals[44] else 0,
+                    "mcap":float(vals[44])*1e8 if vals[44] else 0,  # QQ接口返回亿元，转为元
                     "turnover":float(vals[38]) if vals[38] else 0,
                     "vol_ratio":float(vals[49]) if vals[49] else 0}
         except: pass
     return info
 
-# ========== 技术指标 ==========
+# ========== 事件驱动：公告与新闻抓取 ==========
+EVENT_RULES = [
+    # 格式: (事件类型, [关键词], 基础分)
+    # 负面事件优先匹配（短期冲击大、需要被看见）
+    ("减持", ["减持", "减持计划", "减持股份"], -15),
+    ("预减", ["预减", "业绩预减", "亏损", "净利润下降", "营收下降", "业绩下滑"], -18),
+    ("解禁", ["解禁", "限售股解禁", "限售股上市"], -10),
+    ("增发", ["增发", "配股", "可转债", "定增"], -6),
+    ("关联交易", ["关联交易"], -3),
+    # 正面事件
+    ("预增", ["预增", "扭亏为盈", "业绩增长", "净利润增长", "营收增长", "同比大增", "大幅盈利"], 20),
+    ("重大合同", ["重大合同", "中标", "签订", "框架协议", "战略合作协议", "采购合同"], 15),
+    ("增持", ["增持", "增持计划", "增持股份"], 12),
+    ("回购", ["回购", "股份回购", "回购股份"], 10),
+    ("扩产", ["扩产", "产能扩张", "投产", "新建项目", "扩建", "产能释放", "产线建设"], 8),
+    ("股权激励", ["股权激励", "员工持股计划", "限制性股票"], 6),
+    ("分红", ["分红", "权益分派", "派息", "高送转", "转增"], 5),
+]
+
+def classify_event(title):
+    """根据公告标题识别事件类型和基础分"""
+    t = title.lower()
+    for event_type, keywords, score in EVENT_RULES:
+        for kw in keywords:
+            if kw in t:
+                return event_type, score
+    return None, 0
+
+def calc_event_score(events, today_str, max_lookback=10):
+    """
+    对近 max_lookback 天内的事件进行衰减评分。
+    同一类型只取最强影响；不同类型可叠加。
+    返回: (score_delta, {event_type: (delta, title, date)})
+    """
+    if not events:
+        return 0, {}
+    today_dt = datetime.strptime(today_str, "%Y-%m-%d")
+    best_by_type = {}
+    for e in events:
+        edate = e.get("date", "")
+        if not edate: continue
+        try:
+            edt = datetime.strptime(edate, "%Y-%m-%d")
+        except ValueError:
+            continue
+        days = (today_dt - edt).days
+        if days < 0 or days > max_lookback:
+            continue
+        event_type = e.get("event_type")
+        base = e.get("base_score", 0)
+        if not event_type or base == 0:
+            continue
+        factor = max(0, 1 - days / max_lookback)
+        adj = round(base * factor)
+        if adj == 0: continue  # 衰减后无影响，跳过
+        if event_type not in best_by_type or abs(adj) > abs(best_by_type[event_type][0]):
+            best_by_type[event_type] = (adj, e.get("title", ""), edate)
+    total = sum(v[0] for v in best_by_type.values())
+    # 信息面事件冲击上下限
+    total = max(-25, min(25, total))
+    return total, best_by_type
+
+def fetch_news_events(codes, lookback_days=14, limit=20):
+    """
+    使用 westock-data 批量获取公告，返回 {code: [{title, date, event_type, base_score}, ...]}。
+    每批处理 10 只股票，避免接口超时或返回过多。
+    """
+    import subprocess
+    script = "/Applications/WorkBuddy.app/Contents/Resources/app.asar.unpacked/resources/builtin-skills/westock-data/scripts/index.js"
+    events = {}
+    today = datetime.now().strftime("%Y-%m-%d")
+    today_dt = datetime.strptime(today, "%Y-%m-%d")
+
+    def to_symbol(c):
+        return f"sh{c}" if c.startswith(("6", "9")) else f"sz{c}"
+
+    batch_size = 10
+    for i in range(0, len(codes), batch_size):
+        batch = codes[i:i+batch_size]
+        symbols = ",".join(to_symbol(c) for c in batch)
+        cmd = ["node", script, "notice", "list", symbols, "--limit", str(limit), "--raw"]
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            if res.returncode != 0:
+                print(f"  [WARN] 事件获取失败: {res.stderr[:200]}")
+                continue
+            data = json.loads(res.stdout)
+            items = []
+            if isinstance(data, list):
+                items = data
+            elif isinstance(data, dict) and "sections" in data:
+                for sec in data["sections"]:
+                    if isinstance(sec, list):
+                        items.extend(sec)
+            for item in items:
+                symbol = item.get("symbol", "")
+                if not symbol or len(symbol) < 6: continue
+                code = symbol[2:]
+                title = item.get("title", "")
+                ts = item.get("time", "")
+                if not title or not ts: continue
+                date = ts.split()[0]
+                # 只保留 lookback 天内
+                try:
+                    edt = datetime.strptime(date, "%Y-%m-%d")
+                except ValueError:
+                    continue
+                if (today_dt - edt).days > lookback_days:
+                    continue
+                event_type, base_score = classify_event(title)
+                if code not in events: events[code] = []
+                events[code].append({
+                    "title": title,
+                    "date": date,
+                    "event_type": event_type,
+                    "base_score": base_score
+                })
+        except Exception as e:
+            print(f"  [WARN] 事件获取异常: {e}")
+        if (i+batch_size) % 50 == 0 or i+batch_size >= len(codes):
+            print(f"  事件: {min(i+batch_size, len(codes))}/{len(codes)}")
+    return events
+
+# ========== 大盘环境 &amp; 板块强度 ==========
+
+def fetch_sector_context():
+    """
+    拉取 sector ranking 数据，返回：
+      market_regime: {"regime": "bullish/neutral/bearish", "market_score_delta": ±3}
+      sector_strength: {"半导体/芯片": +5, "新能源/电力": -3, ...} (每个板块的强度分)
+    """
+    import subprocess
+    script = "/Applications/WorkBuddy.app/Contents/Resources/app.asar.unpacked/resources/builtin-skills/westock-data/scripts/index.js"
+    cmd = ["node", script, "sector", "ranking", "--raw"]
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if res.returncode != 0:
+            return {"regime": "neutral", "market_score_delta": 0}, {}
+        data = json.loads(res.stdout)
+    except:
+        return {"regime": "neutral", "market_score_delta": 0}, {}
+
+    sections = data.get("sections", [])
+    if not sections:
+        return {"regime": "neutral", "market_score_delta": 0}, {}
+
+    # ==== Layer 1: 大盘环境 ====
+    # 用前10个行业的平均涨幅判断市场强弱
+    if len(sections) >= 1 and sections[0]:
+        top10_changes = []
+        for s in sections[0][:10]:
+            try:
+                top10_changes.append(float(s.get("changePct", 0)))
+            except: pass
+        if top10_changes:
+            avg_change = sum(top10_changes) / len(top10_changes)
+            if avg_change > 2:
+                market_regime = {"regime": "bullish", "market_score_delta": 3}
+            elif avg_change < -2:
+                market_regime = {"regime": "bearish", "market_score_delta": -3}
+            else:
+                market_regime = {"regime": "neutral", "market_score_delta": 0}
+        else:
+            market_regime = {"regime": "neutral", "market_score_delta": 0}
+    else:
+        market_regime = {"regime": "neutral", "market_score_delta": 0}
+
+    # ==== Layer 2: 板块相对强度 ====
+    # 申万一级行业名 → 涨跌幅映射
+    industry_change = {}
+    if len(sections) >= 1:
+        for s in sections[0]:
+            try:
+                industry_change[s.get("name", "")] = float(s.get("changePct", 0))
+            except: pass
+
+    # 申万行业 → 我们的主题板块 映射（用于把行业涨幅映射到主题）
+    INDUSTRY_MAP = {
+        "半导体": "半导体/芯片", "元件": "半导体/芯片", "电子化学品": "半导体/芯片",
+        "光学光电子": "半导体/芯片", "消费电子": "电子/消费电子",
+        "计算机设备": "AI/算力/通信", "IT服务": "AI/算力/通信", "软件开发": "AI/算力/通信",
+        "通信设备": "AI/算力/通信", "通信服务": "AI/算力/通信",
+        "电力设备": "新能源/电力", "电网设备": "新能源/电力", "光伏设备": "新能源/电力",
+        "风电设备": "新能源/电力", "电池": "新能源/电力", "电力": "新能源/电力",
+        "煤炭开采": "新能源/电力", "石油石化": "新能源/电力", "环保": "新能源/电力",
+        "油气开采": "新能源/电力", "公用事业": "新能源/电力",
+        "传媒": "传媒/游戏", "游戏": "传媒/游戏", "影视院线": "传媒/游戏",
+        "广告营销": "传媒/游戏", "出版": "传媒/游戏",
+        "自动化设备": "智能制造", "通用设备": "智能制造", "专用设备": "智能制造",
+        "汽车零部件": "智能制造", "汽车整车": "智能制造", "军工电子": "智能制造",
+        "航空装备": "智能制造", "航海装备": "智能制造", "地面兵装": "智能制造",
+        "工程机械": "智能制造", "轨交设备": "智能制造",
+        "化学制药": "医药生物", "生物制品": "医药生物", "医疗器械": "医药生物",
+        "医药商业": "医药生物", "中药": "医药生物", "医疗服务": "医药生物",
+        "化学制品": "化工/新材料", "化学原料": "化工/新材料", "塑料": "化工/新材料",
+        "橡胶": "化工/新材料", "非金属材料": "化工/新材料", "金属新材料": "化工/新材料",
+        "建筑材料": "化工/新材料", "装修建材": "化工/新材料", "钢铁": "化工/新材料",
+        "有色金属": "化工/新材料", "工业金属": "化工/新材料", "能源金属": "化工/新材料",
+        "小金属": "化工/新材料", "贵金属": "化工/新材料",
+        "饮料制造": "消费", "食品加工": "消费", "白色家电": "消费",
+        "黑色家电": "消费", "小家电": "消费", "厨卫电器": "消费", "照明设备": "消费",
+        "服装家纺": "消费", "纺织制造": "消费", "饰品": "消费",
+        "造纸": "消费", "包装印刷": "消费", "文娱用品": "消费",
+        "家居用品": "消费", "美容护理": "消费", "旅游零售": "消费",
+        "酒店餐饮": "消费", "旅游及景区": "消费", "体育": "消费",
+        "教育": "消费", "专业服务": "消费",
+        "银行": "金融/交通/基建", "证券": "金融/交通/基建", "保险": "金融/交通/基建",
+        "多元金融": "金融/交通/基建",
+        "铁路公路": "金融/交通/基建", "航运港口": "金融/交通/基建",
+        "航空机场": "金融/交通/基建", "物流": "金融/交通/基建",
+        "建筑装饰": "金融/交通/基建", "房地产": "金融/交通/基建",
+        "房地产开发": "金融/交通/基建", "房地产服务": "金融/交通/基建",
+    }
+
+    # 按主题板块聚合涨跌幅
+    theme_change = {}
+    theme_count = {}
+    for ind_name, change in industry_change.items():
+        theme = INDUSTRY_MAP.get(ind_name)
+        if theme:
+            if theme not in theme_change:
+                theme_change[theme] = 0
+                theme_count[theme] = 0
+            theme_change[theme] += change
+            theme_count[theme] += 1
+        # 模糊匹配：如果行业名包含主题关键词
+        elif "半导体" in ind_name or "芯片" in ind_name or "PCB" in ind_name:
+            theme = "半导体/芯片"
+        elif "通信" in ind_name:
+            theme = "AI/算力/通信"
+        elif "计算机" in ind_name or "软件" in ind_name:
+            theme = "AI/算力/通信"
+        elif "电力" in ind_name or "能源" in ind_name:
+            theme = "新能源/电力"
+        elif "传媒" in ind_name or "游戏" in ind_name:
+            theme = "传媒/游戏"
+        elif "汽车" in ind_name or "机械" in ind_name:
+            theme = "智能制造"
+        elif "医药" in ind_name or "医疗" in ind_name:
+            theme = "医药生物"
+        elif "化工" in ind_name or "材料" in ind_name:
+            theme = "化工/新材料"
+        elif "银行" in ind_name or "证券" in ind_name or "保险" in ind_name:
+            theme = "金融/交通/基建"
+        elif "食品" in ind_name or "饮料" in ind_name or "家电" in ind_name:
+            theme = "消费"
+        else:
+            continue
+        if theme not in theme_change:
+            theme_change[theme] = 0
+            theme_count[theme] = 0
+        theme_change[theme] += change
+        theme_count[theme] += 1
+
+    # 计算每个主题板块的平均涨跌幅
+    sector_strength = {}
+    for theme in theme_change:
+        if theme_count[theme] > 0:
+            avg = theme_change[theme] / theme_count[theme]
+            # V6修正：收紧板块领涨阈值（回测显示+1分太弱），只给最强板块加分
+            if avg > 3:
+                sector_strength[theme] = 5
+            elif avg > 1.5:
+                sector_strength[theme] = 3
+            elif avg > 0:
+                sector_strength[theme] = 0  # 微涨不加分
+            elif avg > -2:
+                sector_strength[theme] = 0
+            elif avg > -5:
+                sector_strength[theme] = -3
+            else:
+                sector_strength[theme] = -5
+
+    return market_regime, sector_strength
+
+# ========== 主力资金净流向 ==========
+
+def fetch_fund_flow(codes):
+    """批量获取主力资金净流向，返回 {code: {main_net_5d, main_net_20d, inflow_rate, ...}}"""
+    import subprocess
+    script = "/Applications/WorkBuddy.app/Contents/Resources/app.asar.unpacked/resources/builtin-skills/westock-data/scripts/index.js"
+    results = {}
+
+    def to_symbol(c):
+        return f"sh{c}" if c.startswith(("6", "9")) else f"sz{c}"
+
+    batch_size = 10
+    for i in range(0, len(codes), batch_size):
+        batch = codes[i:i+batch_size]
+        symbols = ",".join(to_symbol(c) for c in batch)
+        cmd = ["node", script, "fund", "flow", symbols, "--raw"]
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            if res.returncode != 0:
+                continue
+            data = json.loads(res.stdout)
+            if not isinstance(data, list):
+                continue
+            for item in data:
+                sym = item.get("symbol", "")
+                if not sym or len(sym) < 6:
+                    continue
+                code = sym[2:]
+                try:
+                    main_5d = float(item.get("MainNetFlow5D", 0))
+                    main_20d = float(item.get("MainNetFlow20D", 0))
+                    inflow_rate = float(item.get("MainInflowCircRate", 0))
+                    jumbo = float(item.get("JumboNetFlow", 0))
+                    main_today = float(item.get("MainNetFlow", 0))
+                except (ValueError, TypeError):
+                    continue
+                results[code] = {
+                    "main_net_5d": main_5d,
+                    "main_net_20d": main_20d,
+                    "inflow_rate": inflow_rate,
+                    "jumbo_net": jumbo,
+                    "main_net_today": main_today,
+                }
+        except Exception as e:
+            print(f"  [WARN] 资金流获取异常: {e}")
+        if (i+batch_size) % 50 == 0 or i+batch_size >= len(codes):
+            print(f"  资金流: {min(i+batch_size, len(codes))}/{len(codes)}")
+    return results
+
+# ========== 风险因子：质押/解禁/商誉 ==========
+
+def fetch_risk_factors(codes):
+    """批量获取风险因子，返回 {code: {pledge_ratio, unlock_days, ...}}"""
+    import subprocess
+    script = "/Applications/WorkBuddy.app/Contents/Resources/app.asar.unpacked/resources/builtin-skills/westock-data/scripts/index.js"
+    results = {}
+
+    def to_symbol(c):
+        return f"sh{c}" if c.startswith(("6", "9")) else f"sz{c}"
+
+    batch_size = 10
+    for i in range(0, len(codes), batch_size):
+        batch = codes[i:i+batch_size]
+        symbols = ",".join(to_symbol(c) for c in batch)
+        cmd = ["node", script, "risk", symbols, "--types", "pledge,unlock", "--raw"]
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            if res.returncode != 0: continue
+            data = json.loads(res.stdout)
+            items = data if isinstance(data, list) else data.get("data", [])
+            if isinstance(items, list):
+                for item in items:
+                    sym = item.get("symbol", "")
+                    if not sym or len(sym) < 6: continue
+                    code = sym[2:]
+                    if code not in results:
+                        results[code] = {"pledge": 0, "unlock_days": 999}
+                    pledge = item.get("pledgeRatio") or item.get("pledge_ratio") or 0
+                    try: pledge = float(pledge)
+                    except: pledge = 0
+                    if pledge > results[code].get("pledge", 0):
+                        results[code]["pledge"] = pledge
+                    unlock_date = item.get("unlockDate") or item.get("unlock_date") or ""
+                    if unlock_date:
+                        try:
+                            from datetime import datetime
+                            ud = datetime.strptime(str(unlock_date)[:10], "%Y-%m-%d")
+                            days = (ud - datetime.now()).days
+                            if 0 <= days < results[code].get("unlock_days", 999):
+                                results[code]["unlock_days"] = days
+                        except: pass
+        except: pass
+        if (i+batch_size) % 50 == 0 or i+batch_size >= len(codes):
+            print(f"  风险因子: {min(i+batch_size, len(codes))}/{len(codes)}")
+    return results
+
+# ========== 融资融券数据 ==========
+
+def fetch_margin_data(codes):
+    """获取融资余额日环比变化，返回 {code: {margin_dod, margin_total}}"""
+    import subprocess
+    script = "/Applications/WorkBuddy.app/Contents/Resources/app.asar.unpacked/resources/builtin-skills/westock-data/scripts/index.js"
+    results = {}
+
+    def to_symbol(c):
+        return f"sh{c}" if c.startswith(("6", "9")) else f"sz{c}"
+
+    for i, code in enumerate(codes):
+        sym = to_symbol(code)
+        cmd = ["node", script, "fund", "margin", sym, "--raw"]
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+            if res.returncode != 0: continue
+            data = json.loads(res.stdout)
+            item = data.get("data", {})
+            if not item: continue
+            try:
+                margin_dod = float(item.get("FinanceValueDOD", 0))
+                margin_total = float(item.get("FinanceValue", 0))
+            except (ValueError, TypeError):
+                continue
+            results[code] = {"margin_dod": margin_dod, "margin_total": margin_total}
+        except: pass
+        if (i+1) % 50 == 0:
+            print(f"  融资融券: {i+1}/{len(codes)}")
+    return results
+
+
 def calc_ma(p,n):
     if len(p)<n: return None
     return sum(p[-n:])/n
@@ -81,8 +483,10 @@ def calc_rsi(c,n=14):
     return 100-100/(1+g/l)
 
 # ========== SS-Enhanced 评分 ==========
-def score_ss_enhanced(klines, idx):
-    """SS-Enhanced 评分引擎，返回评分 + 各维度分值 + 加减分因子明细"""
+def score_ss_enhanced(klines, idx, event_list=None, today_str=None, extra=None,
+                      market_regime=None, sector_strength=None, fund_flow=None,
+                      margin_data=None):
+    """SS-Enhanced 评分引擎，返回评分 + 各维度分值 + 加减分因子明细 + 事件摘要"""
     if idx < 60: return None
     w = klines[:idx+1]
     c=[k['close'] for k in w]; v=[k['volume'] for k in w]
@@ -105,23 +509,33 @@ def score_ss_enhanced(klines, idx):
             tech-=10
             add("技术面","均线空头排列",-10,f"MA5({ma5:.2f})<MA10({ma10:.2f})<MA20({ma20:.2f})")
     dif=calc_ema(c,12); dea=calc_ema(c,26)
+    # V7：MACD已与均线多头高度重叠(Jaccard 0.64)，降权
     if dif and dea and dif>dea and dif>0:
-        tech+=5
-        add("技术面","MACD金叉且多头",5,f"DIF({dif:.2f})>DEA({dea:.2f}),DIF>0")
+        if ma5 and ma10 and ma20 and ma5>ma10>ma20:
+            tech += 2  # 均线多头已+15，MACD仅象征性加分
+        else:
+            tech += 5
+            add("技术面","MACD金叉且多头",5,f"DIF({dif:.2f})>DEA({dea:.2f}),DIF>0")
+            add("技术面","MACD金叉且多头",3,f"DIF({dif:.2f})>DEA({dea:.2f}),DIF>0")
     elif dif and dif<0:
         tech-=3
         add("技术面","MACD空头区域",-3,f"DIF({dif:.2f})<0")
     if 40<=rsi<=55:
-        tech+=8
-        add("技术面","RSI健康回调区",8,f"RSI={rsi:.1f}(40-55)")
+        # V6修正：回测显示RSI 40-55是负超额(-1.03%)，不是买点
+        tech -= 3
+        add("技术面","RSI弱势区",-3,f"RSI={rsi:.1f}(40-55),回测跑输")
     elif 55<rsi<=70:
-        tech+=12
-        add("技术面","RSI强势区",12,f"RSI={rsi:.1f}(55-70)")
+        # V7：RSI 55-70回测超额-1.01%，不再加分
+        pass
+    # V7: RSI极端(>80)与RSI强动量(>75)合并，只取最强
+    if rsi>80:
+        tech += 12
+        add("技术面","RSI极端强势",12,f"RSI={rsi:.1f}(>80),动量延续")
     elif rsi>75:
-        tech+=5
-        add("技术面","RSI超买区",5,f"RSI={rsi:.1f}(>75)")
+        tech += 10
+        add("技术面","RSI强动量区",10,f"RSI={rsi:.1f}(>75)")
     elif rsi<30:
-        tech-=8
+        tech -= 8
         add("技术面","RSI超卖区",-8,f"RSI={rsi:.1f}(<30)")
     av5=sum(v[-6:-1])/5 if len(v)>=6 else v[-1]
     vr5=v[-1]/av5 if av5>0 else 1
@@ -148,8 +562,9 @@ def score_ss_enhanced(klines, idx):
             tech-=8
             add("技术面","过度偏离MA20",-8,f"偏离MA20 +{dev:.1f}%")
         elif -5<dev<-2:
-            tech+=5
-            add("技术面","回调至MA20附近",5,f"偏离MA20 {dev:.1f}%")
+            # V6修正：回测显示回调至MA20是-2.55%超额，不是买点
+            tech -= 5
+            add("技术面","MA20下方弱势",-5,f"偏离MA20 {dev:.1f}%,回测跑输")
     if len(c)>=120:
         h52,l52=max(h[-120:]),min(l[-120:])
         pct52=(c[-1]-l52)/(h52-l52)*100 if h52>l52 else 50
@@ -159,12 +574,8 @@ def score_ss_enhanced(klines, idx):
         elif pct52>90:
             tech-=5
             add("技术面","52周高位区",-5,f"52周位置{pct52:.0f}%")
-    if rsi>80:
-        tech=min(tech,70)
-        add("技术面","RSI严重超买封顶",0,f"RSI={rsi:.1f}>80,技术面封顶70")
-    if ma5 and (c[-1]-ma5)/ma5*100>8:
-        tech=min(tech,65)
-        add("技术面","短期超涨封顶",0,f"偏离MA5 +{(c[-1]-ma5)/ma5*100:.1f}%>8%,技术面封顶65")
+    # V6修正：RSI>80封顶和MA5超涨封顶已移到上方动量加分，不再压制
+    tech=max(5,min(95,int(tech)))
     tech=max(5,min(95,int(tech)))
 
     # ---- 资金面 ----
@@ -175,12 +586,7 @@ def score_ss_enhanced(klines, idx):
         if tp[i]>tp[i-1]: pf+=mf
         else: nf+=mf
     mfi=100-100/(1+pf/nf) if nf>0 else 50
-    if mfi>60:
-        capital+=12
-        add("资金面","MFI资金流入",12,f"MFI={mfi:.1f}(>60)")
-    elif mfi<40:
-        capital-=5
-        add("资金面","MFI资金流出",-5,f"MFI={mfi:.1f}(<40)")
+    # 先算 CMF（在MFI判断前）
     mf_vol=[]
     for i in range(-20,0):
         if h[i]==l[i]: mf=0
@@ -193,12 +599,22 @@ def score_ss_enhanced(klines, idx):
     elif cmf<-0.15:
         capital-=10
         add("资金面","CMF资金净流出",-10,f"CMF={cmf:.2f}(<-0.15)")
+
+    if mfi<40:
+        capital-=5
+        add("资金面","MFI资金流出",-5,f"MFI={mfi:.1f}(<40)")
+
+    # V7：MFI流入删除（回测-0.66%超额，且与CMF重叠）
     tv=sum(v[-20:])
     if tv>0: vwap20=sum(c[i]*v[i] for i in range(-20,0))/tv
     else: vwap20=c[-1]
     if c[-1]>vwap20*1.03:
-        capital+=5
-        add("资金面","突破VWAP20",5,f"收盘{c[-1]:.2f}>VWAP20 {vwap20:.2f}×1.03")
+        # V7：突破VWAP20与均线多头重叠(Jaccard 0.79)，降权；独立触发时给足
+        if ma5 and ma10 and ma20 and ma5>ma10>ma20:
+            capital += 1  # 均线多头已奖励，仅象征加分
+        else:
+            capital += 3
+            add("资金面","突破VWAP20",3,f"收盘{c[-1]:.2f}>VWAP20 {vwap20:.2f}×1.03")
     if len(v)>=5:
         vt=sum(1 for i in range(-5,0) if v[i]>v[i-1])
         if vt>=4:
@@ -206,13 +622,120 @@ def score_ss_enhanced(klines, idx):
             add("资金面","持续放量",10,f"近5日中{vt}天放量")
     if h[-1]>l[-1]:
         cs=(c[-1]-l[-1])/(h[-1]-l[-1])*100
-        if cs>80 and v[-1]>av5*1.3:
-            capital+=10
-            add("资金面","收盘强势+放量",10,f"收盘位置{cs:.0f}%且量>5日均量1.3倍")
-        elif cs<20 and v[-1]>av5*1.3:
-            capital-=10
-            add("资金面","收盘弱势+放量",-10,f"收盘位置{cs:.0f}%且量>5日均量1.3倍")
+        # V7：收盘强势+放量回测-0.34%，删除
+
+    # ==== V4 新增：换手率异常（基于成交量）====
+    if len(v) >= 21:
+        v20_avg = sum(v[-21:-1]) / 20
+        if v20_avg > 0:
+            v20_ratio = v[-1] / v20_avg
+            if v20_ratio > 3:
+                if c[-1] > c[-2]:
+                    capital += 8
+                    add("资金面","巨量突破",8,f"量比20日={v20_ratio:.1f}(>3)收阳,关注度飙升")
+                else:
+                    capital -= 6
+                    add("资金面","巨量出货",-6,f"量比20日={v20_ratio:.1f}(>3)收阴,资金撤离")
+            elif v20_ratio > 2 and c[-1] > c[-2]:
+                capital += 4
+                add("资金面","显著放量上涨",4,f"量比20日={v20_ratio:.1f}(>2)收阳")
+
+    # ==== V4 新增：振幅异常 ====
+    if len(c) >= 21:
+        ampl_today = (h[-1] - l[-1]) / c[-1] * 100
+        ampl_hist = []
+        for i in range(-21, -1):
+            if h[i] != l[i] and c[i] != 0:
+                ampl_hist.append((h[i] - l[i]) / c[i] * 100)
+        if ampl_hist:
+            ampl_avg = sum(ampl_hist) / len(ampl_hist)
+            if ampl_today > ampl_avg * 2 and ampl_today > 5:
+                if c[-1] > o[-1]:
+                    capital += 5
+                    add("资金面","高振幅收阳",5,f"振幅{ampl_today:.1f}%(>均{ampl_avg:.1f}%×2),博弈中多头占优")
+                else:
+                    capital -= 5
+                    add("资金面","高振幅收阴",-5,f"振幅{ampl_today:.1f}%(>均{ampl_avg:.1f}%×2),博弈中空头占优")
+
+    # ==== V4 新增：市值分层 ====
+    if extra:
+        mcap = extra.get("mcap", 0)
+        if mcap > 100000000000:  # >1000亿
+            capital += 3
+            add("资金面","大市值稳定性",3,f"市值{mcap/1e8:.0f}亿,流动性优势")
+        elif mcap < 5000000000 and mcap > 0:  # <50亿
+            # V6修正：小市值-4.91%超额，加大惩罚
+            capital -= 8
+            add("资金面","小市值高波动",-8,f"市值{mcap/1e8:.0f}亿,回测显著跑输")
+
+    # ==== V6 新增：主力资金净流向 ====
+    if fund_flow:
+        ff = fund_flow
+        main_5d = ff.get("main_net_5d", 0)
+        main_20d = ff.get("main_net_20d", 0)
+        inflow_rate = ff.get("inflow_rate", 0)
+        jumbo = ff.get("jumbo_net", 0)
+
+        # 5日主力持续净流入
+        if main_5d > 0 and main_20d > 0:
+            capital += 8
+            add("资金面","主力持续流入",8,f"5日净流入{main_5d/1e4:.0f}万,20日净流入{main_20d/1e4:.0f}万")
+        elif main_5d > 0 and inflow_rate > 0.5:
+            capital += 5
+            add("资金面","主力短期流入",5,f"5日净流入{main_5d/1e4:.0f}万,占流通{inflow_rate:.1f}%")
+
+        # 主力持续净流出
+        if main_5d < 0 and main_20d < 0:
+            capital -= 8
+            add("资金面","主力持续流出",-8,f"5日净流出{abs(main_5d)/1e4:.0f}万,20日净流出{abs(main_20d)/1e4:.0f}万")
+        elif main_5d < 0:
+            capital -= 5
+            add("资金面","主力短期流出",-5,f"5日净流出{abs(main_5d)/1e4:.0f}万")
+
+        # 超大单方向
+        if jumbo > 0 and main_5d > 0:
+            capital += 3
+            add("资金面","超大单强势",3,f"超大单净流入{jumbo/1e4:.0f}万")
+
+    # ==== V7 新增：风险因子 ====
+    if extra:
+        risk = extra.get("_risk", {})
+        pledge = risk.get("pledge", 0)
+        unlock_days = risk.get("unlock_days", 999)
+        if pledge > 50:
+            capital -= 15
+            add("风险","高质押风险",-15,f"质押比例{pledge:.0f}%>50%")
+        elif pledge > 30:
+            capital -= 8
+            add("风险","中等质押风险",-8,f"质押比例{pledge:.0f}%>30%")
+        if unlock_days <= 7:
+            capital -= 10
+            add("风险","解禁临近",-10,f"{unlock_days}天内有限售股解禁")
+
+    # ==== V7 新增：融资余额变化 ====
+    if margin_data:
+        mdod = margin_data.get("margin_dod", 0)
+        if mdod > 10:
+            capital -= 8
+            add("风险","融资激增",-8,f"融资余额日增{mdod:.0f}%,过度杠杆风险")
+        elif mdod < -5:
+            capital -= 5
+            add("风险","融资骤降",-5,f"融资余额日降{abs(mdod):.0f}%,资金撤离")
+
     capital=max(5,min(95,int(capital)))
+
+    # ==== V5 新增：大盘环境 + 板块强度 ====
+    sector = extra.get("_sector", "") if extra else ""
+    if market_regime:
+        md = market_regime.get("market_score_delta", 0)
+        if md != 0:
+            label = "大盘强势" if md > 0 else "大盘弱势"
+            add("大盘", label, md, f"前10行业均涨幅判定市场为{market_regime.get('regime','')}")
+
+    if sector_strength and sector and sector in sector_strength:
+        ss = sector_strength[sector]
+        if ss != 0:
+            add("板块", f"板块{'领涨' if ss > 0 else '拖累'}", ss, f"{sector}板块当日强度分={ss:+d}")
 
     # ---- 信息面 ----
     r3=(c[-1]/c[-4]-1)*100 if len(c)>=4 else 0
@@ -225,8 +748,9 @@ def score_ss_enhanced(klines, idx):
     gap=(o[-1]-c[-2])/c[-2]*100 if len(c)>=2 else 0
     if abs(gap)>3:
         if gap>0:
-            info+=10
-            add("信息面","跳空高开",10,f"缺口+{gap:.1f}%")
+            # V6修正：跳空高开是回测第一因子(+6.20%超额)，加大分值
+            info += 15
+            add("信息面","跳空高开",15,f"缺口+{gap:.1f}%")
         else:
             info-=5
             add("信息面","跳空低开",-5,f"缺口{gap:.1f}%")
@@ -247,71 +771,289 @@ def score_ss_enhanced(klines, idx):
     if gap>2 and c[-1]<o[-1]:
         info=min(info,60)
         add("信息面","冲高回落封顶",0,f"跳空+{gap:.1f}%但收阴,信息面封顶60")
+
+    # ==== 事件驱动评分 ====
+    event_summary = {}
+    if event_list and today_str:
+        edelta, event_summary = calc_event_score(event_list, today_str)
+        info += edelta
+        # 记录到加减分因子
+        for etype, (delta, title, edate) in sorted(event_summary.items(), key=lambda x: abs(x[1][0]), reverse=True):
+            if delta > 0:
+                add("事件", f"{etype}公告", delta, f"{edate} {title[:40]}")
+            elif delta < 0:
+                add("事件", f"{etype}公告", delta, f"{edate} {title[:40]}")
+
     info=max(5,min(95,int(info)))
 
-    return {"score":round(tech*0.4+capital*0.4+info*0.2),"tech":tech,"capital":capital,"info":info,"factors":factors}
+    return {
+        "score": round(tech*0.4 + capital*0.4 + info*0.2),
+        "tech": tech, "capital": capital, "info": info,
+        "factors": factors,
+        "event_summary": event_summary,
+    }
 
 def get_suggestion(score):
+    # V7校准：冗余合并+废项删除后分数下移，阈值同步下调
     if score>=75: return "🔥强烈买入","strong_buy"
     elif score>=70: return "🟢逢低买入","buy"
     elif score>=60: return "🟡持有","hold"
     elif score>=45: return "⚪观望","watch"
     else: return "🔴回避","avoid"
 
-# ========== 主题板块（12个以内，合并近似概念）==========
+# ========== 主题板块（10个，根据申万一级行业 + 主营估值逻辑）==========
 THEME_SECTORS = {
-    "半导体": ["半导体", "PCB", "存储芯片", "AI芯片", "半导体材料", "半导体设备", "半导体检测", "半导体/MLCC", "半导体/封测", "半导体/CPU", "半导体/硅片", "半导体/晶振", "半导体/存储", "半导体/功率", "半导体/代工", "半导体/接口", "半导体/特气", "半导体材料/光刻胶", "半导体材料/锗"],
-    "光通信/CPO": ["光通信", "CPO", "光模块", "光通信/CPO", "光通信/光纤", "光通信/激光", "光通信/激光器", "光通信/滤光片", "光通信/晶体", "光通信/光学"],
-    "AI/算力": ["AI", "算力", "AI服务器", "AI应用", "AI芯片", "机器视觉", "数字经济", "云计算", "IDC", "智能硬件", "安防/AI", "AI应用/教育", "AI应用/软件", "AI应用/传媒", "机器视觉/AI", "算力/AI服务器", "算力/IDC", "算力/通信", "云计算/IDC"],
-    "新能源/储能": ["新能源", "储能", "光伏", "锂电", "风电", "电力", "电力设备", "液冷", "新能源/锂电池", "新能源/氟化工", "新能源/汽车", "光伏/储能", "光伏/自动化", "液冷/储能", "风电/锻造", "电力设备/变压器", "电力设备/特高压", "电力设备/电缆", "电力设备/照明", "煤炭/能源"],
-    "机器人/智能制造": ["机器人", "智能制造", "自动化", "工业自动化", "机器人/减速器", "机器人/电机", "机器人/轴承", "机器人/热管理", "机器人/精密件"],
-    "汽车零部件": ["汽车", "零部件", "制动", "热管理", "传感器", "精密件", "汽车零部件/热管理", "汽车零部件/传感器", "汽车零部件/精密件", "汽车零部件/制动"],
-    "消费电子": ["消费电子", "电子", "FPC", "连接器", "玻璃", "TV", "结构件", "消费电子/连接器", "消费电子/FPC", "消费电子/玻璃", "消费电子/TV", "消费电子/结构件"],
-    "新材料": ["新材料", "化工", "玻纤", "陶瓷", "绝缘", "膜", "钛合金", "锆", "硅化工", "复材", "新材料/硅化工", "新材料/锆", "新材料/复材", "新材料/陶瓷", "新材料/玻纤", "新材料/绝缘", "新材料/化工", "新材料/膜", "新材料/钛合金"],
-    "游戏/传媒": ["游戏", "传媒", "影视", "营销", "出版", "广告", "数据", "游戏/AI", "游戏/出海", "影视/传媒", "传媒/营销", "传媒/出版", "传媒/数据", "传媒/广告"],
-    "金融/交通": ["金融", "银行", "保险", "证券", "交通运输", "铁路", "金融/银行", "交通运输/铁路"],
-    "医疗/其他": ["医疗", "医药", "ST", "水利", "泵阀", "航空维修", "家居", "医疗信息化", "家居/ST", "泵阀/水利", "航空维修"],
+    "半导体/芯片": ["半导体/芯片"],
+    "AI/算力/通信": ["AI/算力/通信"],
+    "新能源/电力": ["新能源/电力"],
+    "传媒/游戏": ["传媒/游戏"],
+    "智能制造": ["智能制造"],
+    "电子/消费电子": ["电子/消费电子"],
+    "化工/新材料": ["化工/新材料"],
+    "消费": ["消费"],
+    "医药生物": ["医药生物"],
+    "金融/交通/基建": ["金融/交通/基建"],
 }
 
-# ========== 细粒度板块（每只股票的精确板块）==========
+# ========== 股票→主题板块映射（申万一级行业 → 估值板块，2026-07-01 重构）==========
 STOCK_SECTOR = {
-    "000034":"数字经济","000559":"汽车零部件","000636":"半导体/MLCC","000791":"电力","000977":"AI服务器",
-    "001309":"存储芯片","001339":"智能硬件","002009":"智能制造","002027":"传媒/广告","002028":"电力设备",
-    "002050":"机器人/热管理","002112":"电力设备","002130":"消费电子","002131":"泵阀/水利","002149":"新材料/钛合金",
-    "002222":"光通信/晶体","002261":"AI应用/教育","002272":"液冷/储能","002281":"光通信","002284":"汽车零部件/制动",
-    "002338":"半导体设备","002371":"半导体设备","002384":"消费电子/FPC","002407":"新能源/氟化工","002415":"安防/AI",
-    "002428":"半导体材料/锗","002429":"消费电子/TV","002463":"PCB/半导体","002472":"机器人/减速器","002475":"消费电子/连接器",
-    "002517":"游戏/AI","002536":"汽车零部件/热管理","002555":"游戏/出海","002602":"游戏/AI","002837":"液冷/储能",
-    "002896":"机器人/减速器","002916":"PCB/半导体","002927":"电力设备","300014":"新能源/锂电池","300054":"半导体材料",
-    "300058":"传媒/营销","300093":"光伏/储能","300096":"医疗信息化","300124":"工业自动化","300182":"影视/传媒",
-    "300274":"光伏/储能","300285":"新材料/陶瓷","300291":"影视/传媒","300308":"光通信/CPO","300346":"半导体材料",
-    "300394":"光通信/CPO","300408":"半导体/MLCC","300418":"AI应用","300424":"航空维修","300433":"消费电子/玻璃",
-    "300442":"算力/IDC","300476":"PCB/半导体","300481":"新材料/化工","300499":"液冷/储能","300502":"光通信/CPO",
-    "300533":"游戏/出海","300567":"半导体检测","300570":"光通信/CPO","300580":"机器人/精密件","300624":"AI应用/软件",
-    "300643":"汽车零部件/传感器","300655":"半导体材料/光刻胶","300666":"半导体材料","300738":"算力/IDC","300757":"光伏/自动化",
-    "300806":"新材料/膜","300827":"光伏/储能","301012":"电力设备/变压器","301183":"光通信/滤光片","301231":"AI应用/传媒",
-    "301308":"存储芯片","301358":"新能源/锂电池","301486":"消费电子/连接器","301526":"新材料/复材","301630":"新能源/汽车",
-    "600021":"电力","600089":"电力设备/特高压","600176":"新材料/玻纤","600550":"电力设备/变压器","600584":"半导体/封测",
-    "600633":"传媒/数据","600919":"金融/银行","601006":"交通运输/铁路","601208":"新材料/绝缘","601225":"煤炭/能源",
-    "601328":"金融/银行","601398":"金融/银行","601689":"汽车零部件/热管理","601869":"光通信/光纤","601921":"传媒/出版",
-    "603019":"算力/AI服务器","603040":"汽车零部件/精密件","603083":"光通信/CPO","603119":"汽车零部件","603220":"算力/通信",
-    "603228":"PCB/半导体","603389":"家居/ST","603444":"游戏","603618":"电力设备/电缆","603626":"消费电子/结构件",
-    "603663":"新材料/锆","603667":"机器人/轴承","603685":"电力设备/照明","603728":"机器人/电机","603738":"半导体/晶振",
-    "603938":"新材料/硅化工","603985":"风电/锻造","603986":"半导体/存储","688008":"半导体/接口","688012":"半导体设备",
-    "688017":"机器人/减速器","688025":"光通信/激光","688041":"半导体/CPU","688126":"半导体/硅片","688146":"半导体/特气",
-    "688158":"云计算/IDC","688160":"机器人/电机","688167":"光通信/激光","688183":"PCB/半导体","688195":"光通信/光学",
-    "688256":"AI芯片","688268":"半导体/特气","688347":"半导体/代工","688396":"半导体/功率","688400":"机器视觉/AI",
-    "688498":"光通信/激光器","688515":"半导体/接口","688676":"电力设备/变压器",
+    "000034":"AI/算力/通信",
+    "000333":"消费",
+    "000519":"智能制造",
+    "000524":"消费",
+    "000559":"智能制造",
+    "000628":"金融/交通/基建",
+    "000636":"半导体/芯片",
+    "000791":"新能源/电力",
+    "000858":"消费",
+    "000892":"传媒/游戏",
+    "000938":"AI/算力/通信",
+    "000977":"AI/算力/通信",
+    "000988":"智能制造",
+    "001300":"消费",
+    "001309":"半导体/芯片",
+    "001339":"AI/算力/通信",
+    "002009":"智能制造",
+    "002027":"传媒/游戏",
+    "002028":"新能源/电力",
+    "002050":"消费",
+    "002108":"化工/新材料",
+    "002112":"新能源/电力",
+    "002121":"新能源/电力",
+    "002130":"半导体/芯片",
+    "002131":"智能制造",
+    "002149":"化工/新材料",
+    "002202":"新能源/电力",
+    "002210":"新能源/电力",
+    "002222":"半导体/芯片",
+    "002229":"消费",
+    "002261":"AI/算力/通信",
+    "002270":"新能源/电力",
+    "002272":"智能制造",
+    "002281":"AI/算力/通信",
+    "002284":"智能制造",
+    "002292":"传媒/游戏",
+    "002304":"消费",
+    "002335":"新能源/电力",
+    "002338":"智能制造",
+    "002345":"消费",
+    "002371":"半导体/芯片",
+    "002384":"半导体/芯片",
+    "002400":"传媒/游戏",
+    "002407":"化工/新材料",
+    "002414":"智能制造",
+    "002415":"AI/算力/通信",
+    "002425":"传媒/游戏",
+    "002428":"化工/新材料",
+    "002429":"消费",
+    "002463":"半导体/芯片",
+    "002472":"智能制造",
+    "002475":"电子/消费电子",
+    "002517":"传媒/游戏",
+    "002536":"智能制造",
+    "002555":"传媒/游戏",
+    "002602":"传媒/游戏",
+    "002630":"新能源/电力",
+    "002826":"医药生物",
+    "002837":"智能制造",
+    "002851":"新能源/电力",
+    "002896":"智能制造",
+    "002916":"半导体/芯片",
+    "002922":"电子/消费电子",
+    "002927":"新能源/电力",
+    "002931":"智能制造",
+    "300010":"消费",
+    "300014":"新能源/电力",
+    "300054":"半导体/芯片",
+    "300058":"传媒/游戏",
+    "300093":"新能源/电力",
+    "300096":"AI/算力/通信",
+    "300124":"智能制造",
+    "300133":"传媒/游戏",
+    "300136":"电子/消费电子",
+    "300182":"传媒/游戏",
+    "300229":"AI/算力/通信",
+    "300251":"传媒/游戏",
+    "300272":"消费",
+    "300274":"新能源/电力",
+    "300285":"电子/消费电子",
+    "300291":"传媒/游戏",
+    "300302":"AI/算力/通信",
+    "300308":"AI/算力/通信",
+    "300315":"传媒/游戏",
+    "300346":"半导体/芯片",
+    "300353":"AI/算力/通信",
+    "300364":"传媒/游戏",
+    "300373":"半导体/芯片",
+    "300394":"AI/算力/通信",
+    "300408":"电子/消费电子",
+    "300418":"传媒/游戏",
+    "300424":"智能制造",
+    "300433":"电子/消费电子",
+    "300439":"医药生物",
+    "300442":"AI/算力/通信",
+    "300450":"新能源/电力",
+    "300463":"医药生物",
+    "300465":"AI/算力/通信",
+    "300476":"半导体/芯片",
+    "300481":"电子/消费电子",
+    "300497":"医药生物",
+    "300499":"智能制造",
+    "300502":"AI/算力/通信",
+    "300533":"传媒/游戏",
+    "300567":"智能制造",
+    "300570":"AI/算力/通信",
+    "300580":"智能制造",
+    "300620":"AI/算力/通信",
+    "300624":"AI/算力/通信",
+    "300642":"医药生物",
+    "300643":"智能制造",
+    "300655":"半导体/芯片",
+    "300666":"半导体/芯片",
+    "300738":"AI/算力/通信",
+    "300750":"新能源/电力",
+    "300757":"智能制造",
+    "300781":"传媒/游戏",
+    "300806":"化工/新材料",
+    "300827":"新能源/电力",
+    "301012":"新能源/电力",
+    "301018":"智能制造",
+    "301080":"医药生物",
+    "301183":"半导体/芯片",
+    "301209":"化工/新材料",
+    "301231":"传媒/游戏",
+    "301236":"AI/算力/通信",
+    "301308":"半导体/芯片",
+    "301358":"新能源/电力",
+    "301377":"智能制造",
+    "301396":"AI/算力/通信",
+    "301408":"医药生物",
+    "301486":"电子/消费电子",
+    "301526":"化工/新材料",
+    "301630":"半导体/芯片",
+    "600021":"新能源/电力",
+    "600032":"新能源/电力",
+    "600089":"新能源/电力",
+    "600109":"金融/交通/基建",
+    "600171":"半导体/芯片",
+    "600176":"化工/新材料",
+    "600186":"消费",
+    "600269":"金融/交通/基建",
+    "600276":"医药生物",
+    "600330":"半导体/芯片",
+    "600351":"医药生物",
+    "600518":"医药生物",
+    "600519":"消费",
+    "600550":"新能源/电力",
+    "600584":"半导体/芯片",
+    "600585":"化工/新材料",
+    "600618":"化工/新材料",
+    "600633":"传媒/游戏",
+    "600674":"新能源/电力",
+    "600703":"半导体/芯片",
+    "600707":"电子/消费电子",
+    "600801":"化工/新材料",
+    "600892":"传媒/游戏",
+    "600919":"金融/交通/基建",
+    "600938":"新能源/电力",
+    "600941":"AI/算力/通信",
+    "601006":"金融/交通/基建",
+    "601012":"新能源/电力",
+    "601101":"新能源/电力",
+    "601127":"智能制造",
+    "601138":"电子/消费电子",
+    "601208":"化工/新材料",
+    "601216":"化工/新材料",
+    "601225":"新能源/电力",
+    "601318":"金融/交通/基建",
+    "601328":"金融/交通/基建",
+    "601398":"金融/交通/基建",
+    "601689":"智能制造",
+    "601869":"AI/算力/通信",
+    "601872":"金融/交通/基建",
+    "601919":"金融/交通/基建",
+    "601921":"传媒/游戏",
+    "601928":"传媒/游戏",
+    "603019":"AI/算力/通信",
+    "603040":"智能制造",
+    "603083":"AI/算力/通信",
+    "603119":"智能制造",
+    "603200":"新能源/电力",
+    "603220":"AI/算力/通信",
+    "603228":"半导体/芯片",
+    "603259":"医药生物",
+    "603389":"消费",
+    "603396":"新能源/电力",
+    "603444":"传媒/游戏",
+    "603607":"消费",
+    "603618":"新能源/电力",
+    "603619":"新能源/电力",
+    "603626":"半导体/芯片",
+    "603629":"半导体/芯片",
+    "603663":"化工/新材料",
+    "603667":"智能制造",
+    "603685":"电子/消费电子",
+    "603703":"电子/消费电子",
+    "603728":"新能源/电力",
+    "603738":"半导体/芯片",
+    "603938":"化工/新材料",
+    "603985":"新能源/电力",
+    "603986":"半导体/芯片",
+    "603993":"化工/新材料",
+    "605006":"化工/新材料",
+    "605277":"电子/消费电子",
+    "605287":"金融/交通/基建",
+    "688008":"半导体/芯片",
+    "688012":"半导体/芯片",
+    "688017":"智能制造",
+    "688025":"智能制造",
+    "688041":"半导体/芯片",
+    "688072":"半导体/芯片",
+    "688126":"半导体/芯片",
+    "688146":"半导体/芯片",
+    "688158":"AI/算力/通信",
+    "688160":"智能制造",
+    "688167":"半导体/芯片",
+    "688183":"半导体/芯片",
+    "688195":"半导体/芯片",
+    "688256":"半导体/芯片",
+    "688268":"半导体/芯片",
+    "688347":"半导体/芯片",
+    "688396":"半导体/芯片",
+    "688400":"智能制造",
+    "688498":"半导体/芯片",
+    "688499":"新能源/电力",
+    "688515":"半导体/芯片",
+    "688521":"半导体/芯片",
+    "688676":"新能源/电力",
+    "688795":"半导体/芯片",
+    "832571":"智能制造",
+    "920808":"智能制造",
 }
 
 def get_theme(code):
-    """细粒度板块 → 主题板块（12个以内）"""
-    s = STOCK_SECTOR.get(code, "其他")
-    for theme, keywords in THEME_SECTORS.items():
-        for kw in keywords:
-            if kw in s:
-                return theme
-    return "其他"
+    """直接返回预设主题板块（基于申万行业+主营估值）"""
+    return STOCK_SECTOR.get(code, "其他")
 
 # ========== 生成报告 ==========
 def generate_report(results, today, output_dir, hist_scores=None):
@@ -340,7 +1082,7 @@ def generate_report(results, today, output_dir, hist_scores=None):
     hold_list=[r for r in results if r["sug_action"]=="hold"]
     watch_list=[r for r in results if r["sug_action"]=="watch"]
     avoid_list=[r for r in results if r["sug_action"]=="avoid"]
-    risky=[r for r in avoid_list if r["score"]<45]
+    risky=[r for r in avoid_list if r["score"]<50]
     critical=[r for r in avoid_list if r["score"]<40]
     
     sectors={}
@@ -369,15 +1111,36 @@ def generate_report(results, today, output_dir, hist_scores=None):
     
     md=[]
     md.append(f"# 📊 SS-Enhanced 股票评分日报")
-    md.append(f"**日期**: {today} | **模型**: SS-Enhanced V2 | **股票池**: {len(results)}只A股")
+    md.append(f"**日期**: {today} | **模型**: SS-Enhanced V7 | **股票池**: {len(results)}只A股")
     md.append(f"")
     md.append(f"## 📈 市场概况")
-    md.append(f"- 🔥强烈买入(≥75): **{len(strong_buy)}只** | 🟢逢低买入(≥70): **{len(buy_list)}只** | 🟡持有(60-69): **{len(hold_list)}只** | ⚪观望(45-59): **{len(watch_list)}只** | 🔴回避(<45): **{len(avoid_list)}只**")
+    md.append(f"- 🔥强烈买入(≥80): **{len(strong_buy)}只** | 🟢逢低买入(≥75): **{len(buy_list)}只** | 🟡持有(65-74): **{len(hold_list)}只** | ⚪观望(50-64): **{len(watch_list)}只** | 🔴回避(<50): **{len(avoid_list)}只**")
     md.append(f"- 🚨触发卖出(<40): **{len(critical)}只** | ⚠️持续低分预警: **{len(risky)}只**")
     md.append(f"- 板块覆盖: {len(sectors)}个 | 主力: {', '.join(f'{s}({n})' for s,n in top_sectors)}")
     md.append(f"")
-    
-    # ===== 第一部分：TOP 5 + 最差 5 =====
+
+    # ==== 重要事件摘要 ====
+    event_stocks = []
+    for r in results:
+        es = r.get("event_summary", {})
+        if es:
+            tags_list = []
+            for etype, (delta, title, edate) in sorted(es.items(), key=lambda x: abs(x[1][0]), reverse=True):
+                emoji = "🔴" if delta < 0 else "🟢"
+                tags_list.append(f"{emoji}{etype}({delta:+d})")
+            event_stocks.append((r["code"], r["name"], r["score"], tags_list))
+    if event_stocks:
+        md.append(f"## 📰 重要事件（近两周公告）")
+        md.append(f"")
+        md.append(f"> 共 **{len(event_stocks)}只** 股票存在有评分影响的关键公告")
+        md.append(f"")
+        for code, name, score, tags in sorted(event_stocks, key=lambda x: x[2], reverse=True)[:30]:
+            md.append(f"- **{code} {name}**({score}分) {' '.join(tags)}")
+        if len(event_stocks) > 30:
+            md.append(f"- ...共{len(event_stocks)}只有事件影响（详见 HTML 报告）")
+        md.append(f"")
+
+    # ===== 第一部分：TOP 5 + 快速变化 =====
     md.append(f"## 🏆 综合排名概览")
     md.append(f"")
     md.append(f"### 🔥 最佳 TOP 5")
@@ -386,17 +1149,34 @@ def generate_report(results, today, output_dir, hist_scores=None):
     for r in results[:5]:
         md.append(row(r))
     md.append("")
-    
-    md.append(f"### 🔴 最差 BOTTOM 5")
+
+    # 快速上升/快速下滑（基于历史评分变化）
+    def score_delta(code):
+        scores = hist_scores.get(code, [])
+        if len(scores) < 2: return 0
+        return int(scores[-1]) - int(scores[-2])
+
+    risers = sorted(results, key=lambda r: score_delta(r["code"]), reverse=True)[:5]
+    fallers = sorted(results, key=lambda r: score_delta(r["code"]))[:5]
+
+    md.append(f"### 🚀 快速上升 TOP 5（评分跳升）")
     md.append(f"")
-    if critical:
-        md.append(f"> 🚨 其中 **{len([r for r in results[-5:] if r['score']<40])}只** 已触发卖出阈值")
-        md.append(f"")
     md.append(rhdr); md.append(rsep)
-    for r in results[-5:]:
-        risk = "🚨强制卖出" if r["score"] < 40 else "⚠️持续低分"
+    for r in risers:
+        d = score_delta(r["code"])
+        icon = "🚀" if d >= 5 else "📈"
         t=trend_str(r["code"])
-        md.append(f"| {r['code']} | {r['name']} | {r.get('sector','')} | **{r['score']}** | {t} | {r['price']:.2f} | {r['change_pct']:+.2f}% | {r['ret_5d']:+.1f}% | {r['ret_20d']:+.1f}% | {risk} |")
+        md.append(f"| {r['code']} | {r['name']} | {r.get('sector','')} | **{r['score']}** | {t} | {r['price']:.2f} | {r['change_pct']:+.2f}% | {r['ret_5d']:+.1f}% | {r['ret_20d']:+.1f}% | {icon} +{d} |")
+    md.append("")
+
+    md.append(f"### 🔻 快速下滑 TOP 5（评分急降）")
+    md.append(f"")
+    md.append(rhdr); md.append(rsep)
+    for r in fallers:
+        d = score_delta(r["code"])
+        icon = "🔻" if d <= -5 else "📉"
+        t=trend_str(r["code"])
+        md.append(f"| {r['code']} | {r['name']} | {r.get('sector','')} | **{r['score']}** | {t} | {r['price']:.2f} | {r['change_pct']:+.2f}% | {r['ret_5d']:+.1f}% | {r['ret_20d']:+.1f}% | {icon} {d} |")
     md.append("")
     
     # ===== 第二部分：全部股票按概念板块分组 =====
@@ -482,7 +1262,7 @@ def generate_html_report(results, today, hist_scores, strong_buy, buy_list, hold
     TD_NUM  = 'padding:7px 6px;font-size:13px;color:#333;text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums'
 
     def make_factors_detail_html(r):
-        """生成加减分因子明细HTML（用于展开行）"""
+        """生成加减分因子明细HTML（用于展开行），含关键事件"""
         factors = r.get("factors", [])
         if not factors:
             return '<p style="color:#999;font-size:12px;margin:0">暂无分析数据</p>'
@@ -492,6 +1272,29 @@ def generate_html_report(results, today, hist_scores, strong_buy, buy_list, hold
         parts = []
         # 维度分值
         parts.append(f'<div style="margin-bottom:8px"><span style="font-size:12px;color:#666;margin-right:12px">技术面 <b style="color:#1a1a2e;font-size:14px">{r.get("tech",50)}</b></span><span style="font-size:12px;color:#666;margin-right:12px">资金面 <b style="color:#1a1a2e;font-size:14px">{r.get("capital",50)}</b></span><span style="font-size:12px;color:#666">信息面 <b style="color:#1a1a2e;font-size:14px">{r.get("info",50)}</b></span><span style="font-size:12px;color:#888;margin-left:12px">权重: 技术40% · 资金40% · 信息20%</span></div>')
+        # 关键事件
+        event_summary = r.get("event_summary", {})
+        events = r.get("events", [])
+        if event_summary or events:
+            parts.append('<div style="margin-bottom:8px">')
+            parts.append('<span style="font-size:12px;color:#7c3aed;font-weight:600">📰 近两周关键事件</span>')
+            if event_summary:
+                for etype, (delta, title, edate) in sorted(event_summary.items(), key=lambda x: abs(x[1][0]), reverse=True):
+                    color = "#dc2626" if delta < 0 else "#16a34a"
+                    bg = "#fef2f2" if delta < 0 else "#f0fdf4"
+                    tag = "🔴" if delta < 0 else "🟢"
+                    parts.append(f'<div style="margin:4px 0;padding:4px 10px;border-radius:6px;background:{bg};font-size:12px">{tag} <b style="color:{color}">{etype} {delta:+d}</b> <span style="color:#666;font-size:11px">[{edate}]</span> <span style="color:#333">{title[:80]}</span></div>')
+            elif events:
+                # 无评分事件，直接显示所有原始事件
+                shown = 0
+                for ev in events[:6]:
+                    if shown >= 5: break
+                    shown += 1
+                    etag = "🔴" if (ev.get("base_score") or 0) < 0 else "⚪"
+                    parts.append(f'<div style="margin:2px 0;font-size:11px;color:#666">{etag} [{ev.get("date","")}] {ev.get("title","")[:80]}</div>')
+                if len(events) > 5:
+                    parts.append(f'<div style="font-size:10px;color:#999">...共{len(events)}条公告</div>')
+            parts.append('</div>')
         if pos:
             parts.append('<div style="margin-bottom:6px"><span style="font-size:12px;color:#166534;font-weight:600">🟢 加分项</span></div>')
             tags = []
@@ -613,27 +1416,39 @@ def generate_html_report(results, today, hist_scores, strong_buy, buy_list, hold
 
     # ---- 统计卡片 ----
     stat_cards = [
-        ("#fbbf24", "#fef3c7", "#92400e", len(strong_buy), "🔥 强烈买入 ≥75"),
-        ("#4ade80", "#dcfce7", "#166534", len(buy_list), "🟢 逢低买入 ≥70"),
-        ("#60a5fa", "#dbeafe", "#1e40af", len(hold_list), "🟡 持有 60-69"),
-        ("#94a3b8", "#f1f5f9", "#475569", len(watch_list), "⚪ 观望 45-59"),
-        ("#f87171", "#fee2e2", "#991b1b", len(avoid_list), "🔴 回避 <45"),
+        ("#fbbf24", "#fef3c7", "#92400e", len(strong_buy), "🔥 强烈买入 ≥80"),
+        ("#4ade80", "#dcfce7", "#166534", len(buy_list), "🟢 逢低买入 ≥75"),
+        ("#60a5fa", "#dbeafe", "#1e40af", len(hold_list), "🟡 持有 65-74"),
+        ("#94a3b8", "#f1f5f9", "#475569", len(watch_list), "⚪ 观望 50-64"),
+        ("#f87171", "#fee2e2", "#991b1b", len(avoid_list), "🔴 回避 <50"),
         ("#ef4444", "#fecaca", "#7f1d1d", len(critical), "🚨 触发卖出 <40"),
     ]
     card_html = ""
     for color, bg, text_color, count, label in stat_cards:
         card_html += f'<div style="background:{bg};border-radius:10px;padding:12px 8px;text-align:center;border:1px solid {color}33;flex:1;min-width:100px"><div style="font-size:24px;font-weight:800;color:{text_color};line-height:1.2">{count}</div><div style="font-size:11px;color:{text_color};margin-top:3px">{label}</div></div>'
 
-    # ---- TOP5 快速摘要 ----
+    # ---- TOP5 / 快速上升 / 快速下滑 摘要 ----
     top5_summary = ""
     for r in results[:5]:
         top5_summary += f'<span style="display:inline-block;margin:3px 6px 3px 0;padding:3px 10px;border-radius:8px;background:#fef3c7;font-size:12px;color:#92400e;font-weight:600">{r["code"]} {r["name"]} <b>{r["score"]}</b></span>'
 
-    bottom5_summary = ""
-    for r in results[-5:]:
-        bg_color = "#fecaca" if r["score"] < 40 else "#fee2e2"
-        text_color = "#7f1d1d" if r["score"] < 40 else "#991b1b"
-        bottom5_summary += f'<span style="display:inline-block;margin:3px 6px 3px 0;padding:3px 10px;border-radius:8px;background:{bg_color};font-size:12px;color:{text_color};font-weight:600">{r["code"]} {r["name"]} <b>{r["score"]}</b></span>'
+    def score_delta(code):
+        scores = hist_scores.get(code, [])
+        if len(scores) < 2: return 0
+        return int(scores[-1]) - int(scores[-2])
+
+    risers = sorted(results, key=lambda r: score_delta(r["code"]), reverse=True)[:5]
+    fallers = sorted(results, key=lambda r: score_delta(r["code"]))[:5]
+
+    risers_summary = ""
+    for r in risers:
+        d = score_delta(r["code"])
+        risers_summary += f'<span style="display:inline-block;margin:3px 6px 3px 0;padding:3px 10px;border-radius:8px;background:#dcfce7;font-size:12px;color:#166534;font-weight:600">{r["code"]} {r["name"]} <b>{r["score"]}</b> +{d}</span>'
+
+    fallers_summary = ""
+    for r in fallers:
+        d = score_delta(r["code"])
+        fallers_summary += f'<span style="display:inline-block;margin:3px 6px 3px 0;padding:3px 10px;border-radius:8px;background:#fef2f2;font-size:12px;color:#dc2626;font-weight:600">{r["code"]} {r["name"]} <b>{r["score"]}</b> {d}</span>'
 
     # ---- 完整HTML ----
     html = f"""<!DOCTYPE html>
@@ -655,7 +1470,8 @@ body {{ margin:0; padding:0; background:#eef0f5; font-family:-apple-system,Blink
 .summary {{ padding:8px 28px; }}
 .summary h3 {{ margin:8px 0 6px; font-size:14px; }}
 .top5 {{ margin-bottom:12px; }}
-.bottom5 {{}}
+.risers {{ margin-bottom:12px; }}
+.fallers {{}}
 .tab-bar {{ display:flex; gap:4px; padding:8px 28px 0; flex-wrap:wrap; border-bottom:2px solid #e8ecf1; }}
 .tab-btn {{ padding:7px 14px; border:none; border-radius:8px 8px 0 0; cursor:pointer; font-size:13px; font-weight:500; background:#f1f5f9; color:#64748b; transition:all .15s; font-family:inherit; }}
 .tab-btn:hover {{ background:#e2e8f0; color:#334155; }}
@@ -689,19 +1505,20 @@ function toggleDetail(id) {{
 <div class="container">
   <div class="header">
     <h1>📊 SS-Enhanced 股票评分日报</h1>
-    <p><strong>{today}</strong> &nbsp;|&nbsp; SS-Enhanced V2 &nbsp;|&nbsp; {len(results)}只A股 &nbsp;|&nbsp; 板块覆盖: {len(sectors)}个</p>
+    <p><strong>{today}</strong> &nbsp;|&nbsp; SS-Enhanced V7 &nbsp;|&nbsp; {len(results)}只A股 &nbsp;|&nbsp; 板块覆盖: {len(sectors)}个</p>
   </div>
   <div class="stats">{card_html}</div>
   <p class="stat-note">主力板块: {', '.join(f'{s}({n})' for s, n in top_sectors)}</p>
   <div class="summary">
     <div class="top5"><h3 style="color:#92400e">🔥 最佳 TOP 5</h3>{top5_summary}</div>
-    <div class="bottom5"><h3 style="color:#991b1b">🔴 最差 BOTTOM 5</h3>{bottom5_summary}</div>
+    <div class="risers"><h3 style="color:#166534">🚀 快速上升 TOP 5</h3>{risers_summary}</div>
+    <div class="fallers"><h3 style="color:#dc2626">🔻 快速下滑 TOP 5</h3>{fallers_summary}</div>
   </div>
   <div class="tab-bar">{tab_buttons_html}</div>
   {tab_panels_html}
   <div class="footer">
-    <p>自动生成 | SS-Enhanced V2 | 策略: ≥75强烈买入 · ≥70逢低买入 · ≥60持有 · ≥45观望 · &lt;45回避 · &lt;40触发卖出</p>
-    <p style="margin-top:4px">V3回测(120天·15891条): 评分≥75纯高分10日超额+2.65% · 放量回调(1.1-1.5x)20日超额+5.8% · 缩量回调解读为陷阱</p>
+    <p>自动生成 | SS-Enhanced V7 | 策略: ≥75强烈买入 · ≥70逢低买入 · ≥60持有 · ≥45观望 · <45回避 · <40触发卖出
+    <p style="margin-top:4px">V6: 回测驱动权重修正+主力资金+板块阈值; V5: 大盘环境+板块强度</p>
   </div>
 </div>
 </body></html>"""
@@ -758,13 +1575,17 @@ def generate_email_html_report(results, today, hist_scores, strong_buy, buy_list
     TBL = "width:100%;border-collapse:collapse;font-family:-apple-system,BlinkMacSystemFont,'PingFang SC','Microsoft YaHei',sans-serif;table-layout:fixed"
 
     def make_factors_compact(r):
-        """生成紧凑版加减分标签（用于邮件子行）"""
+        """生成紧凑版加减分标签（用于邮件子行），含关键事件"""
         factors = r.get("factors", [])
-        if not factors:
-            return ""
-        pos = sorted([f for f in factors if f["delta"] > 0], key=lambda x: x["delta"], reverse=True)[:3]
+        pos = sorted([f for f in factors if f["delta"] > 0], key=lambda x: x["delta"], reverse=True)[:2]
         neg = sorted([f for f in factors if f["delta"] < 0], key=lambda x: x["delta"])[:2]
         tags = []
+        # 事件标签优先
+        evs = r.get("event_summary", {})
+        for etype, (delta, title, edate) in sorted(evs.items(), key=lambda x: abs(x[1][0]), reverse=True)[:3]:
+            bg_c = "#fef2f2" if delta < 0 else "#f0fdf4"
+            tc = "#dc2626" if delta < 0 else "#16a34a"
+            tags.append(f'<span style="display:inline-block;margin:1px 3px;padding:1px 6px;border-radius:4px;background:{bg_c};color:{tc};font-size:11px">📰{etype}{delta:+d}</span>')
         for f in pos:
             tags.append(f'<span style="display:inline-block;margin:1px 3px;padding:1px 6px;border-radius:4px;background:#dcfce7;color:#166534;font-size:11px">{f["name"]}+{f["delta"]}</span>')
         for f in neg:
@@ -831,26 +1652,53 @@ def generate_email_html_report(results, today, hist_scores, strong_buy, buy_list
 
     # ---- 统计卡片 ----
     stat_cards = [
-        ("#fef3c7", "#92400e", len(strong_buy), "🔥 强烈买入 ≥75"),
-        ("#dcfce7", "#166534", len(buy_list), "🟢 逢低买入 ≥70"),
-        ("#dbeafe", "#1e40af", len(hold_list), "🟡 持有 60-69"),
-        ("#f1f5f9", "#475569", len(watch_list), "⚪ 观望 45-59"),
-        ("#fee2e2", "#991b1b", len(avoid_list), "🔴 回避 <45"),
+        ("#fef3c7", "#92400e", len(strong_buy), "🔥 强烈买入 ≥80"),
+        ("#dcfce7", "#166534", len(buy_list), "🟢 逢低买入 ≥75"),
+        ("#dbeafe", "#1e40af", len(hold_list), "🟡 持有 65-74"),
+        ("#f1f5f9", "#475569", len(watch_list), "⚪ 观望 50-64"),
+        ("#fee2e2", "#991b1b", len(avoid_list), "🔴 回避 <50"),
         ("#fecaca", "#7f1d1d", len(critical), "🚨 触发卖出 <40"),
     ]
     card_cells = ""
     for bg, text_color, count, label in stat_cards:
         card_cells += f'<td style="padding:6px;width:16.6%"><div style="background:{bg};border-radius:10px;padding:12px 6px;text-align:center;border:1px solid {text_color}22"><div style="font-size:24px;font-weight:800;color:{text_color};line-height:1.2">{count}</div><div style="font-size:11px;color:{text_color};margin-top:3px">{label}</div></div></td>'
 
-    # ---- TOP5 / BOTTOM5 摘要 ----
+    # ---- TOP5 / 快速上升 / 快速下滑 摘要 ----
     top5_tags = ""
     for r in results[:5]:
         top5_tags += f'<span style="display:inline-block;margin:3px 6px 3px 0;padding:3px 10px;border-radius:8px;background:#fef3c7;font-size:12px;color:#92400e;font-weight:600">{r["code"]} {r["name"]} <b>{r["score"]}</b></span>'
-    bottom5_tags = ""
-    for r in results[-5:]:
-        bg_c = "#fecaca" if r["score"] < 40 else "#fee2e2"
-        tc = "#7f1d1d" if r["score"] < 40 else "#991b1b"
-        bottom5_tags += f'<span style="display:inline-block;margin:3px 6px 3px 0;padding:3px 10px;border-radius:8px;background:{bg_c};font-size:12px;color:{tc};font-weight:600">{r["code"]} {r["name"]} <b>{r["score"]}</b></span>'
+
+    def email_delta(code):
+        scores = hist_scores.get(code, [])
+        if len(scores) < 2: return 0
+        return int(scores[-1]) - int(scores[-2])
+
+    risers = sorted(results, key=lambda r: email_delta(r["code"]), reverse=True)[:5]
+    fallers = sorted(results, key=lambda r: email_delta(r["code"]))[:5]
+
+    risers_tags = ""
+    for r in risers:
+        d = email_delta(r["code"])
+        risers_tags += f'<span style="display:inline-block;margin:3px 6px 3px 0;padding:3px 10px;border-radius:8px;background:#dcfce7;font-size:12px;color:#166534;font-weight:600">{r["code"]} {r["name"]} <b>{r["score"]}</b> +{d}</span>'
+
+    fallers_tags = ""
+    for r in fallers:
+        d = email_delta(r["code"])
+        fallers_tags += f'<span style="display:inline-block;margin:3px 6px 3px 0;padding:3px 10px;border-radius:8px;background:#fef2f2;font-size:12px;color:#dc2626;font-weight:600">{r["code"]} {r["name"]} <b>{r["score"]}</b> {d}</span>'
+
+    # ---- 重要事件摘要 ----
+    event_tags = ""
+    for r in results:
+        es = r.get("event_summary", {})
+        if es:
+            for etype, (delta, title, edate) in sorted(es.items(), key=lambda x: abs(x[1][0]), reverse=True):
+                emoji = "🔴" if delta < 0 else "🟢"
+                bg_c = "#fef2f2" if delta < 0 else "#f0fdf4"
+                tc = "#dc2626" if delta < 0 else "#16a34a"
+                event_tags += f'<span style="display:inline-block;margin:2px 4px;padding:2px 8px;border-radius:6px;background:{bg_c};font-size:11px;color:{tc}">{emoji}{r["code"]}{r["name"]}{etype}({delta:+d})</span>'
+    event_section = ""
+    if event_tags:
+        event_section = f'<tr><td style="padding:8px 28px 4px"><h3 style="margin:8px 0 6px;font-size:14px;color:#7c3aed">📰 关键事件（近两周公告）</h3><p style="margin:0 0 10px;line-height:1.8">{event_tags}</p></td></tr>'
 
     # ---- 各板块分段表格 ----
     section_html_parts = []
@@ -889,7 +1737,7 @@ def generate_email_html_report(results, today, hist_scores, strong_buy, buy_list
 <table width="900" cellpadding="0" cellspacing="0" style="background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 2px 16px rgba(0,0,0,0.08)">
 <tr><td style="padding:24px 28px 14px;background:linear-gradient(135deg,#1a1a2e,#16213e)">
 <h1 style="margin:0 0 6px;font-size:20px;color:#e94560">📊 SS-Enhanced 股票评分日报</h1>
-<p style="margin:0;font-size:13px;color:#94a3b8"><strong style="color:#e6edf3">{today}</strong> &nbsp;|&nbsp; SS-Enhanced V2 &nbsp;|&nbsp; {len(results)}只A股 &nbsp;|&nbsp; 板块覆盖: {len(sectors)}个</p>
+<p style="margin:0;font-size:13px;color:#94a3b8"><strong style="color:#e6edf3">{today}</strong> &nbsp;|&nbsp; SS-Enhanced V7 &nbsp;|&nbsp; {len(results)}只A股 &nbsp;|&nbsp; 板块覆盖: {len(sectors)}个</p>
 </td></tr>
 <tr><td style="padding:16px 28px 8px">
 <table width="100%" cellpadding="0" cellspacing="0"><tr>{card_cells}</tr></table>
@@ -898,15 +1746,18 @@ def generate_email_html_report(results, today, hist_scores, strong_buy, buy_list
 <tr><td style="padding:8px 28px 4px">
 <h3 style="margin:8px 0 6px;font-size:14px;color:#92400e">🔥 最佳 TOP 5</h3>
 <p style="margin:0 0 10px">{top5_tags}</p>
-<h3 style="margin:8px 0 6px;font-size:14px;color:#991b1b">🔴 最差 BOTTOM 5</h3>
-<p style="margin:0 0 10px">{bottom5_tags}</p>
+<h3 style="margin:8px 0 6px;font-size:14px;color:#166534">🚀 快速上升 TOP 5</h3>
+<p style="margin:0 0 10px">{risers_tags}</p>
+<h3 style="margin:8px 0 6px;font-size:14px;color:#dc2626">🔻 快速下滑 TOP 5</h3>
+<p style="margin:0 0 10px">{fallers_tags}</p>
 </td></tr>
+{event_section}
 <tr><td style="padding:16px 28px 20px">
 {sections_html}
 </td></tr>
 <tr><td style="padding:14px 28px 20px;text-align:center;border-top:1px solid #e8ecf1">
-<p style="margin:0;font-size:11px;color:#999">自动生成 | SS-Enhanced V2 | 策略: ≥75强烈买入 · ≥70逢低买入 · ≥60持有 · ≥45观望 · &lt;45回避 · &lt;40触发卖出</p>
-<p style="margin:4px 0 0;font-size:11px;color:#999">网格最优回测: 胜率52.9% · 均收益+24.9% · 夏普0.50</p>
+<p style="margin:0;font-size:11px;color:#999">自动生成 | SS-Enhanced V7 | 策略: ≥75强烈买入 · ≥70逢低买入 · ≥60持有 · ≥45观望 · <45回避 · <40触发卖出
+<p style="margin:4px 0 0;font-size:11px;color:#999">V6:回测驱动权重修正+主力资金+板块阈值收紧; V5:大盘+板块</p>
 </td></tr>
 </table>
 </td></tr></table>
@@ -915,33 +1766,50 @@ def generate_email_html_report(results, today, hist_scores, strong_buy, buy_list
     return html
 
 # ========== 发送邮件（QQ邮箱 SMTP）==========
-def send_email(md_path, email_html_path, today, recipient="914110627@qq.com"):
-    """通过QQ邮箱SMTP发送报告邮件（使用邮件专用HTML，全内联样式无JS）"""
+def send_email(md_path, email_html_path, html_path, today, recipient="914110627@qq.com"):
+    """通过QQ邮箱SMTP发送报告邮件（正文+交互版HTML附件）"""
     import smtplib
     from email.mime.text import MIMEText
     from email.mime.multipart import MIMEMultipart
+    from email.mime.base import MIMEBase
+    from email import encoders
     
+    if recipient is None:
+        recipient = "914110627@qq.com"
+
     smtp_config = {
         "host": os.environ.get("SMTP_HOST", "smtp.qq.com"),
         "port": int(os.environ.get("SMTP_PORT", "587")),
         "user": os.environ.get("SMTP_USER", ""),
         "password": os.environ.get("SMTP_PASSWORD", ""),
     }
-    
+
     try:
         with open(md_path) as f: md_content = f.read()
         with open(email_html_path) as f: html_content = f.read()
+        with open(html_path) as f: html_attach = f.read()
     except Exception as e:
         print(f"  [ERROR] 读取报告文件失败: {e}")
         return False
     
-    msg = MIMEMultipart("alternative")
+    msg = MIMEMultipart("mixed")
     msg["Subject"] = f"📊 SS-Enhanced 股票评分日报 {today}"
     msg["From"] = smtp_config["user"]
     msg["To"] = recipient
-    
-    msg.attach(MIMEText(md_content, "plain", "utf-8"))
-    msg.attach(MIMEText(html_content, "html", "utf-8"))
+
+    # 正文（alternative：纯文本 + HTML邮件版）
+    body = MIMEMultipart("alternative")
+    body.attach(MIMEText(md_content, "plain", "utf-8"))
+    body.attach(MIMEText(html_content, "html", "utf-8"))
+    msg.attach(body)
+
+    # 附件：交互版HTML（可在浏览器直接打开）
+    attach = MIMEBase("application", "octet-stream")
+    attach.set_payload(html_attach.encode("utf-8"))
+    encoders.encode_base64(attach)
+    fname = os.path.basename(html_path)
+    attach.add_header("Content-Disposition", "attachment", filename=("utf-8", "", fname))
+    msg.attach(attach)
     
     try:
         server = smtplib.SMTP(smtp_config["host"], smtp_config["port"], timeout=30)
@@ -976,18 +1844,50 @@ def run_daily_scoring(stock_codes, output_dir="/workspace", send_mail=True, reci
     for code, date_scores in hist_data.items():
         hist_scores[code] = [s for d, s in sorted(date_scores.items())]
     
-    print("\n[1/3] 获取数据...")
+    print("\n[1/5] 获取行情数据...")
     klines = fetch_kline_batch(stock_codes)
     extra = fetch_extra_info(stock_codes)
     print(f"  K线: {len(klines)} | 行情: {len(extra)}")
+
+    print("\n[2/5] 获取板块大盘环境...")
+    market_regime, sector_strength = fetch_sector_context()
+    if market_regime.get("regime") != "neutral":
+        print(f"  大盘: {market_regime['regime']} ({market_regime['market_score_delta']:+d})")
+    print(f"  板块强度: {len(sector_strength)}个板块有信号")
+
+    # 预计算每只股票的主题板块
+    for code in extra:
+        extra[code]["_sector"] = get_theme(code)
+
+    print("\n[3/6] 获取主力资金流向...")
+    fund_flow = fetch_fund_flow(stock_codes)
+    ff_codes = sum(1 for v in fund_flow.values() if v.get("main_net_5d", 0) != 0)
+    print(f"  资金流数据: {ff_codes}只")
+
+    print("\n[4/7] 获取风险因子...")
+    risk_data = fetch_risk_factors(stock_codes)
+    risk_count = sum(1 for v in risk_data.values() if v.get("pledge",0) > 30 or v.get("unlock_days",999) <= 7)
+    print(f"  风险信号: {risk_count}只有质押/解禁风险")
+    for code in extra:
+        extra[code]["_risk"] = risk_data.get(code, {"pledge": 0, "unlock_days": 999})
+
+    print("\n[5/7] 获取公告事件...")
+    news_events = fetch_news_events(stock_codes)
+    ev_codes = sum(1 for v in news_events.values() if v)
+    ev_total = sum(len(v) for v in news_events.values())
+    print(f"  有事件股票: {ev_codes}只 | 事件总数: {ev_total}条")
     
-    print("\n[2/3] 评分中...")
+    print("\n[6/7] 评分中...")
     results = []
     for code in stock_codes:
         kl = klines.get(code)
         if not kl or len(kl) < 60: continue
         ex = extra.get(code, {})
-        s = score_ss_enhanced(kl, len(kl)-1)
+        ev_list = news_events.get(code, [])
+        ff = fund_flow.get(code, {})
+        s = score_ss_enhanced(kl, len(kl)-1, event_list=ev_list, today_str=today, extra=ex,
+                              market_regime=market_regime, sector_strength=sector_strength,
+                              fund_flow=ff)
         if s is None: continue
         ret_5d = (kl[-1]['close']/kl[-6]['close']-1)*100 if len(kl)>=6 else 0
         ret_20d = (kl[-1]['close']/kl[-21]['close']-1)*100 if len(kl)>=21 else 0
@@ -999,6 +1899,8 @@ def run_daily_scoring(stock_codes, output_dir="/workspace", send_mail=True, reci
             "score":s["score"],"tech":s["tech"],"capital":s["capital"],"info":s["info"],
             "suggestion":sug_label,"sug_action":sug_action,
             "factors":s.get("factors",[]),
+            "events": ev_list,
+            "event_summary": s.get("event_summary", {}),
         })
         
         # 按日期存储评分（去重：同一天只保留最新）
@@ -1020,7 +1922,7 @@ def run_daily_scoring(stock_codes, output_dir="/workspace", send_mail=True, reci
     # 保存历史评分
     with open(hist_path, "w") as f: json.dump(hist_data, f, ensure_ascii=False)
     
-    print(f"\n[3/3] 生成报告...")
+    print(f"\n[7/7] 生成报告...")
     sb=sum(1 for r in results if r["sug_action"]=="strong_buy")
     buy=sum(1 for r in results if r["sug_action"]=="buy")
     hold=sum(1 for r in results if r["sug_action"]=="hold")
@@ -1033,11 +1935,11 @@ def run_daily_scoring(stock_codes, output_dir="/workspace", send_mail=True, reci
     
     json_path = os.path.join(output_dir, f"SS增强版评分_{today}.json")
     with open(json_path, "w") as f:
-        json.dump({"date":today,"model":"SS-Enhanced V2","total":len(results),"results":results},f,ensure_ascii=False,indent=2)
+        json.dump({"date":today,"model":"SS-Enhanced V7","total":len(results),"results":results},f,ensure_ascii=False,indent=2)
     
     if send_mail:
         print("\n[邮件] 发送报告...")
-        send_email(md_path, email_html_path, today, recipient)
+        send_email(md_path, email_html_path, html_path, today, recipient)
     
     print(f"\n{'='*50}")
     for r in results[:5]:
