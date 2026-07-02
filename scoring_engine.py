@@ -2324,20 +2324,35 @@ def score_ensemble_glm(codes, klines_all, extra_all, train_days=60):
 
     # Predict today
     result = {}
+    raw_vals = []
+    code_order = []
     for code in codes:
         kl = klines_all.get(code)
         if not kl or len(kl) < 30: continue
         ex = extra_all.get(code, {})
         try:
             fv = _glm_features(kl, len(kl)-1, extra=ex)
-            p_linear = fv @ beta_linear
-            p_poly = _glm_expand(fv.reshape(1,-1))[0] @ beta_poly
-            p_tw = _glm_expand(fv.reshape(1,-1))[0] @ beta_tw
-            # Ensemble average, scale to 0-100
+            p_linear = float(fv @ beta_linear)
+            p_poly = float(_glm_expand(fv.reshape(1,-1))[0] @ beta_poly)
+            p_tw = float(_glm_expand(fv.reshape(1,-1))[0] @ beta_tw)
             raw = (p_linear + p_poly + p_tw) / 3
-            score = int(max(5, min(95, 50 + raw * 8)))  # center at 50, scale
-            result[code] = score
+            raw_vals.append(raw)
+            code_order.append(code)
         except: pass
+
+    # Normalize: use robust Z-score + sigmoid to 5-95
+    if len(raw_vals) < 10:
+        return {}
+    raw = np.array(raw_vals, dtype=float)
+    mu = np.median(raw)  # robust center
+    sigma = max(0.5, np.std(raw))  # prevent collapse
+    z = (raw - mu) / sigma
+    # sigmoid-like mapping to 5-95
+    for code, rv, zv in zip(code_order, raw_vals, z):
+        # range zv from ~-3 to ~+3, map to 5-95
+        normalized = max(-3, min(3, zv))  # clip extreme outliers
+        score = int(5 + (normalized + 3) / 6 * 90)  # [-3,3] → [5,95]
+        result[code] = score
 
     return result
 
@@ -2498,9 +2513,9 @@ def run_daily_scoring(stock_codes, output_dir="/workspace", send_mail=True, reci
     
     md_path, html_path, email_html_path = generate_report(results, today, output_dir, hist_scores)
     
-    json_path = os.path.join(output_dir, f"SS_with_GLM评分_{today}.json")
+    json_path = os.path.join(output_dir, f"SS增强版评分_{today}.json")
     with open(json_path, "w") as f:
-        json.dump({"date":today,"model":"SS with GLM V8","total":len(results),"results":results},f,ensure_ascii=False,indent=2)
+        json.dump({"date":today,"model":"SS with GLM V10","total":len(results),"results":results},f,ensure_ascii=False,indent=2)
     
     if send_mail:
         print("\n[邮件] 发送报告...")
