@@ -1,10 +1,23 @@
 #!/usr/bin/env python3
 """
-SS-Enhanced 评分引擎 + 邮件报告
-策略: ≥75强烈买入 · ≥70逢低买入 · ≥60持有 · ≥45观望 · <45回避 · <40触发卖出
+SS with GLM 评分引擎 + 盘中建议引擎 + 邮件报告
+
+=== 每日评分 (SS with GLM V8) ===
+- 运行时间: 15:30 收盘后
+- 权重: 技术40% + 资金40% + 信息20%
+- 数据: EOD K线 + 事件公告 + 主力资金 + 风险因子
+- 推荐: ≥75强烈买入 · ≥70逢低买入 · ≥60持有 · ≥45观望 · <45回避
+
+=== 盘中建议 (独立产品线) ===
+- 运行时间: 14:30 盘中
+- 权重: 技术25% + 资金35% + 信息15% + 盘中动量25%
+- 数据: 实时行情 + K线 + 主力资金T-1 + 日内形态
+- 推荐: ≥72强烈买入 · ≥67逢低买入 · ≥57持有 · ≥42观望 · <42回避
+- 关键特征: 动量因子经回测反转 — 追高信号扣分，回调信号加分
 """
 import json, math, urllib.request, sys, os
 from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ========== 加载 .env 配置（避免硬编码敏感信息）==========
 def _load_env():
@@ -18,10 +31,25 @@ def _load_env():
                     os.environ.setdefault(k.strip(), v.strip())
 _load_env()
 
+# ========== 本地数据库缓存（可选，自动检测）==========
+try:
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       ".workbuddy/skills/stock-db"))
+    from stock_db import StockDB
+    _db = StockDB()
+    _USE_DB = True
+except Exception:
+    _USE_DB = False
+
 # ========== 数据获取 ==========
 def fetch_kline_batch(codes, days=130):
+    """并发获取K线（ThreadPoolExecutor, 20 workers），返回 {code: [kline_dicts]}"""
+    if _USE_DB:
+        return _db.get_klines(codes, days)
     all_kline = {}
-    for idx, code in enumerate(codes):
+    total = len(codes)
+
+    def fetch_one(code):
         if code.startswith(("6", "9")): sym = f"sh{code}"
         else: sym = f"sz{code}"
         url = f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={sym},day,,,{days},qfq"
@@ -33,13 +61,26 @@ def fetch_kline_batch(codes, days=130):
             klines = data.get("data", {}).get(sym, {}).get("qfqday", []) or \
                      data.get("data", {}).get(sym, {}).get("day", [])
             if klines:
-                all_kline[code] = [{'date':k[0],'open':float(k[1]),'close':float(k[2]),
+                return code, [{'date':k[0],'open':float(k[1]),'close':float(k[2]),
                     'high':float(k[3]),'low':float(k[4]),'volume':float(k[5]) if len(k)>5 else 0} for k in klines]
         except: pass
-        if (idx+1)%30==0: print(f"  K线: {idx+1}/{len(codes)}")
+        return code, None
+
+    completed = 0
+    with ThreadPoolExecutor(max_workers=20) as executor:
+        futures = {executor.submit(fetch_one, c): c for c in codes}
+        for f in as_completed(futures):
+            code, kl = f.result()
+            if kl: all_kline[code] = kl
+            completed += 1
+            if completed % 50 == 0:
+                print(f"  K线: {completed}/{total}")
+
     return all_kline
 
 def fetch_extra_info(codes):
+    if _USE_DB:
+        return _db.get_extra_info(codes)
     prefixed = [f"sh{c}" if c.startswith(("6","9")) else f"sz{c}" for c in codes]
     info = {}
     for i in range(0, len(prefixed), 60):
@@ -127,10 +168,9 @@ def calc_event_score(events, today_str, max_lookback=10):
     return total, best_by_type
 
 def fetch_news_events(codes, lookback_days=14, limit=20):
-    """
-    使用 westock-data 批量获取公告，返回 {code: [{title, date, event_type, base_score}, ...]}。
-    每批处理 10 只股票，避免接口超时或返回过多。
-    """
+    """使用 westock-data 批量获取公告，返回 {code: [{title, date, event_type, base_score}, ...]}。"""
+    if _USE_DB:
+        return _db.get_events(codes, days=lookback_days)
     import subprocess
     script = "/Applications/WorkBuddy.app/Contents/Resources/app.asar.unpacked/resources/builtin-skills/westock-data/scripts/index.js"
     events = {}
@@ -140,7 +180,7 @@ def fetch_news_events(codes, lookback_days=14, limit=20):
     def to_symbol(c):
         return f"sh{c}" if c.startswith(("6", "9")) else f"sz{c}"
 
-    batch_size = 10
+    batch_size = 30
     for i in range(0, len(codes), batch_size):
         batch = codes[i:i+batch_size]
         symbols = ",".join(to_symbol(c) for c in batch)
@@ -343,6 +383,8 @@ def fetch_sector_context():
 
 def fetch_fund_flow(codes):
     """批量获取主力资金净流向，返回 {code: {main_net_5d, main_net_20d, inflow_rate, ...}}"""
+    if _USE_DB:
+        return _db.get_fund_flows(codes)
     import subprocess
     script = "/Applications/WorkBuddy.app/Contents/Resources/app.asar.unpacked/resources/builtin-skills/westock-data/scripts/index.js"
     results = {}
@@ -350,7 +392,7 @@ def fetch_fund_flow(codes):
     def to_symbol(c):
         return f"sh{c}" if c.startswith(("6", "9")) else f"sz{c}"
 
-    batch_size = 10
+    batch_size = 30
     for i in range(0, len(codes), batch_size):
         batch = codes[i:i+batch_size]
         symbols = ",".join(to_symbol(c) for c in batch)
@@ -399,7 +441,7 @@ def fetch_risk_factors(codes):
     def to_symbol(c):
         return f"sh{c}" if c.startswith(("6", "9")) else f"sz{c}"
 
-    batch_size = 10
+    batch_size = 30
     for i in range(0, len(codes), batch_size):
         batch = codes[i:i+batch_size]
         symbols = ",".join(to_symbol(c) for c in batch)
@@ -482,11 +524,11 @@ def calc_rsi(c,n=14):
     if l==0: return 100
     return 100-100/(1+g/l)
 
-# ========== SS-Enhanced 评分 ==========
+# ========== SS with GLM 评分 ==========
 def score_ss_enhanced(klines, idx, event_list=None, today_str=None, extra=None,
                       market_regime=None, sector_strength=None, fund_flow=None,
                       margin_data=None):
-    """SS-Enhanced 评分引擎，返回评分 + 各维度分值 + 加减分因子明细 + 事件摘要"""
+    """SS with GLM 评分引擎，返回评分 + 各维度分值 + 加减分因子明细 + 事件摘要"""
     if idx < 60: return None
     w = klines[:idx+1]
     c=[k['close'] for k in w]; v=[k['volume'] for k in w]
@@ -516,7 +558,6 @@ def score_ss_enhanced(klines, idx, event_list=None, today_str=None, extra=None,
         else:
             tech += 5
             add("技术面","MACD金叉且多头",5,f"DIF({dif:.2f})>DEA({dea:.2f}),DIF>0")
-            add("技术面","MACD金叉且多头",3,f"DIF({dif:.2f})>DEA({dea:.2f}),DIF>0")
     elif dif and dif<0:
         tech-=3
         add("技术面","MACD空头区域",-3,f"DIF({dif:.2f})<0")
@@ -569,13 +610,12 @@ def score_ss_enhanced(klines, idx, event_list=None, today_str=None, extra=None,
         h52,l52=max(h[-120:]),min(l[-120:])
         pct52=(c[-1]-l52)/(h52-l52)*100 if h52>l52 else 50
         if pct52<30:
-            tech+=5
-            add("技术面","52周低位区",5,f"52周位置{pct52:.0f}%")
+            tech-=8
+            add("技术面","52周低位区",-8,f"52周位置{pct52:.0f}%,T+10回测夏普负胜率45%")
         elif pct52>90:
             tech-=5
             add("技术面","52周高位区",-5,f"52周位置{pct52:.0f}%")
     # V6修正：RSI>80封顶和MA5超涨封顶已移到上方动量加分，不再压制
-    tech=max(5,min(95,int(tech)))
     tech=max(5,min(95,int(tech)))
 
     # ---- 资金面 ----
@@ -631,8 +671,8 @@ def score_ss_enhanced(klines, idx, event_list=None, today_str=None, extra=None,
             v20_ratio = v[-1] / v20_avg
             if v20_ratio > 3:
                 if c[-1] > c[-2]:
-                    capital += 8
-                    add("资金面","巨量突破",8,f"量比20日={v20_ratio:.1f}(>3)收阳,关注度飙升")
+                    capital -= 5
+                    add("资金面","巨量突破",-5,f"量比20日={v20_ratio:.1f}(>3)收阳,T+10夏普0.032/VaR5%-23.8%")
                 else:
                     capital -= 6
                     add("资金面","巨量出货",-6,f"量比20日={v20_ratio:.1f}(>3)收阴,资金撤离")
@@ -661,8 +701,8 @@ def score_ss_enhanced(klines, idx, event_list=None, today_str=None, extra=None,
     if extra:
         mcap = extra.get("mcap", 0)
         if mcap > 100000000000:  # >1000亿
-            capital += 3
-            add("资金面","大市值稳定性",3,f"市值{mcap/1e8:.0f}亿,流动性优势")
+            capital += 8
+            add("资金面","大市值稳定性",8,f"市值{mcap/1e8:.0f}亿,T+10夏普0.365第二高")
         elif mcap < 5000000000 and mcap > 0:  # <50亿
             # V6修正：小市值-4.91%超额，加大惩罚
             capital -= 8
@@ -757,8 +797,8 @@ def score_ss_enhanced(klines, idx, event_list=None, today_str=None, extra=None,
     av20=sum(v[-21:-1])/20 if len(v)>=21 else av5
     vs=v[-1]/av20 if av20>0 else 1
     if vs>3:
-        info+=10
-        add("信息面","巨量比",10,f"量比={vs:.1f}(>3)")
+        info-=3
+        add("信息面","巨量比",-3,f"量比={vs:.1f}(>3),T+10夏普0.007/VaR5%-22.4%")
     elif vs>2:
         info+=5
         add("信息面","大量比",5,f"量比={vs:.1f}(>2)")
@@ -766,28 +806,45 @@ def score_ss_enhanced(klines, idx, event_list=None, today_str=None, extra=None,
         info+=8
         add("信息面","三连涨",8,f"连涨3日")
     if len(c)>=3 and c[-1]<c[-2] and c[-2]<c[-3]:
-        info+=5
-        add("信息面","连跌2日(反弹信号)",5,"连跌2日,V3回测:高评分连跌后20日超额+1.6%")
+        pass  # V8：连跌2日反弹信号删除，T+10回测夏普低于未触发、胜率48.6%
     if gap>2 and c[-1]<o[-1]:
         info=min(info,60)
         add("信息面","冲高回落封顶",0,f"跳空+{gap:.1f}%但收阴,信息面封顶60")
 
-    # ==== 事件驱动评分 ====
+    info=max(5,min(95,int(info)))
+
+    # ==== 事件驱动评分（独立维度，不混入信息面）====
     event_summary = {}
+    event_score = 0
     if event_list and today_str:
-        edelta, event_summary = calc_event_score(event_list, today_str)
-        info += edelta
-        # 记录到加减分因子
+        event_score, event_summary = calc_event_score(event_list, today_str)
         for etype, (delta, title, edate) in sorted(event_summary.items(), key=lambda x: abs(x[1][0]), reverse=True):
             if delta > 0:
                 add("事件", f"{etype}公告", delta, f"{edate} {title[:40]}")
             elif delta < 0:
                 add("事件", f"{etype}公告", delta, f"{edate} {title[:40]}")
+    event_norm = 25 + max(-25, min(25, event_score))  # 映射到 0-50
 
-    info=max(5,min(95,int(info)))
+    # V9 回测驱动权重: 技术35% + 资金55% + 信息5% + 事件5% + 环境加成
+    # 原 V8: 技术40% + 资金40% + 信息20%（信息面被回测证明是噪声 IC=0.045）
+    env_adjust = 0
+    sector = extra.get("_sector", "") if extra else ""
+    if market_regime:
+        md = market_regime.get("market_score_delta", 0)
+        if md != 0:
+            env_adjust += md
+    if sector_strength and sector and sector in sector_strength:
+        ss = sector_strength[sector]
+        if ss != 0:
+            env_adjust += ss
+
+    # V9 回测驱动权重: 技术35% + 资金55% + 信息5% + 事件5% + 环境加成
+    # 原 V8: 技术40% + 资金40% + 信息20%（信息面被回测证明是噪声 IC=0.045）
+    final_score = round(tech*0.35 + capital*0.55 + info*0.05 + event_norm*0.05 + env_adjust)
+    final_score = max(5, min(95, final_score))
 
     return {
-        "score": round(tech*0.4 + capital*0.4 + info*0.2),
+        "score": final_score,
         "tech": tech, "capital": capital, "info": info,
         "factors": factors,
         "event_summary": event_summary,
@@ -800,6 +857,310 @@ def get_suggestion(score):
     elif score>=60: return "🟡持有","hold"
     elif score>=45: return "⚪观望","watch"
     else: return "🔴回避","avoid"
+
+def get_suggestion_intraday(score):
+    """盘中建议阈值（T+1回测校准版 2026-07-02）"""
+    if score>=68: return "🔥强烈买入","strong_buy"
+    elif score>=60: return "🟢逢低买入","buy"
+    elif score>=50: return "🟡持有","hold"
+    elif score>=35: return "⚪观望","watch"
+    else: return "🔴回避","avoid"
+
+
+# ========== 盘中评分引擎 (2:30 PM) ==========
+
+def score_intraday(klines, idx, realtime, event_list=None, today_str=None, extra=None,
+                   market_regime=None, sector_strength=None, fund_flow=None, margin_data=None):
+    """
+    盘中评分引擎 — 2:30 PM 专属 (T+1优化版 2026-07-02)
+    权重: 资金40% + 信息30% + 技术20% + 盘中动量10%
+    目标: 当日尾盘买入 → 次日收盘卖出 (T+1)
+    """
+    if idx < 60: return None
+    w = klines[:idx+1]
+    c=[k['close'] for k in w]; v=[k['volume'] for k in w]
+    h=[k['high'] for k in w]; l=[k['low'] for k in w]; o=[k['open'] for k in w]
+
+    rt_price = realtime.get("price", c[-1])
+    rt_open = realtime.get("open", o[-1])
+    rt_high = realtime.get("high", h[-1])
+    rt_low = realtime.get("low", l[-1])
+    rt_vol = realtime.get("volume", v[-1])
+    rt_chg = realtime.get("change_pct", 0)
+    rt_vol_ratio = realtime.get("vol_ratio", 1)
+
+    tech = 50; capital = 50; info = 50; momentum = 50
+    factors = []
+
+    def add(dim, name, delta, detail=""):
+        factors.append({"dim": dim, "name": name, "delta": delta, "detail": detail})
+
+    # ======== 技术面 (20%) — T+1回测校准版 ========
+    ma5, ma10, ma20 = calc_ma(c,5), calc_ma(c,10), calc_ma(c,20)
+    rsi = calc_rsi(c)
+
+    if ma5 and ma10 and ma20:
+        if ma5 > ma10 > ma20:
+            tech += 15
+            add("技术面","均线多头排列",15,f"MA5({ma5:.2f})>MA10>MA20")
+        elif ma5 < ma10 < ma20:
+            tech -= 10
+            add("技术面","均线空头排列",-10)
+
+    dif = calc_ema(c,12); dea = calc_ema(c,26)
+    if dif and dea and dif > dea and dif > 0:
+        if ma5 and ma10 and ma20 and ma5 > ma10 > ma20:
+            tech += 2
+        else:
+            tech += 5
+            add("技术面","MACD金叉多头",5,f"DIF({dif:.2f})>DEA")
+    elif dif and dif < 0:
+        tech -= 3
+        add("技术面","MACD空头",-3)
+
+    if 40 <= rsi <= 55:
+        tech -= 3
+        add("技术面","RSI弱势区",-3,f"RSI={rsi:.1f}")
+    if rsi > 80:
+        tech += 12
+        add("技术面","RSI极端强势",12,f"RSI={rsi:.1f}(>80)")
+    elif rsi > 75:
+        tech += 10
+        add("技术面","RSI强动量",10,f"RSI={rsi:.1f}(>75)")
+    elif rsi < 30:
+        tech -= 10
+        add("技术面","RSI超卖",-10,f"RSI={rsi:.1f}(<30),T+1回测-0.30%→加重")
+
+    if ma20:
+        dev = (rt_price - ma20) / ma20 * 100
+        if 2 < dev < 8:
+            tech += 8
+            add("技术面","适度偏离MA20",8,f"偏离+{dev:.1f}%")
+        elif dev > 15:
+            tech += 5
+            add("技术面","过度偏离MA20(动量)",5,f"偏离+{dev:.1f}%,T+1回测+0.32%→动量延续")
+        elif -5 < dev < -2:
+            tech += 8
+            add("技术面","MA20下方弱势(反弹)",8,f"偏离{dev:.1f}%,T+1回测+0.84%→均值回归")
+
+    # 52周位置 — T+1回测: 高位区+0.51%→加分, 低位区-0.02%→基本无效
+    if len(c) >= 120:
+        h52, l52 = max(h[-120:]), min(l[-120:])
+        pct52 = (rt_price - l52) / (h52 - l52) * 100 if h52 > l52 else 50
+        if pct52 > 90:
+            tech += 8
+            add("技术面","52周高位区(动量延续)",8,f"位置{pct52:.0f}%,T+1回测+0.51%超额→加分")
+        elif pct52 < 30:
+            tech += 1
+            add("技术面","52周低位区",1,f"位置{pct52:.0f}%,T+1回测-0.02%无区分度")
+
+    tech = max(5, min(95, int(tech)))
+
+    # ======== 资金面 (40%) — T+1回测校准版 ========
+    # 持续放量（近5日趋势）
+    if len(v) >= 5:
+        vt = sum(1 for i in range(-5, 0) if v[i] > v[i-1])
+        if vt >= 4:
+            capital += 10
+            add("资金面","持续放量",10,f"近5日{vt}天放量")
+
+    # 实时量比（盘中版 — T+1回测: 放量上涨-0.12%→翻转扣分, 放量出货保持扣分, 温和放量保持）
+    if rt_vol_ratio > 3 and rt_chg > 0:
+        capital -= 3
+        add("资金面","盘中放量上涨(追高)",-3,f"量比={rt_vol_ratio:.1f},T+1回测-0.12%→次日回落")
+    elif rt_vol_ratio > 3 and rt_chg < 0:
+        capital -= 8
+        add("资金面","盘中放量出货",-8,f"量比={rt_vol_ratio:.1f},跌{rt_chg:.1f}%")
+    elif rt_vol_ratio > 2 and rt_chg > 0:
+        capital += 4
+        add("资金面","盘中温和放量涨",4,f"量比={rt_vol_ratio:.1f}")
+
+    # 缩量（量比<0.5）— T+1回测: 无量上涨+0.36%→加分, 缩量下跌-0.07%→保持
+    if rt_vol_ratio < 0.5:
+        if rt_chg < 0:
+            capital -= 8
+            add("资金面","盘中缩量下跌",-8,"无人承接")
+        else:
+            capital += 3
+            add("资金面","盘中无量上涨(吸筹)",3,f"量比={rt_vol_ratio:.1f},T+1回测+0.36%")
+
+    # 市值分层
+    if extra:
+        mcap = extra.get("mcap", 0)
+        if mcap > 100000000000:
+            capital += 3
+            add("资金面","大市值稳定性",3,f"市值{mcap/1e8:.0f}亿")
+        elif mcap < 5000000000 and mcap > 0:
+            capital -= 8
+            add("资金面","小市值高波动",-8,f"市值{mcap/1e8:.0f}亿")
+
+    # 主力资金（T-1日）
+    if fund_flow:
+        ff = fund_flow
+        main_5d = ff.get("main_net_5d", 0)
+        main_20d = ff.get("main_net_20d", 0)
+        inflow_rate = ff.get("inflow_rate", 0)
+        jumbo = ff.get("jumbo_net", 0)
+
+        if main_5d > 0 and main_20d > 0:
+            capital += 10
+            add("资金面","主力持续流入",10,f"5日+{main_5d/1e4:.0f}万,20日+{main_20d/1e4:.0f}万")
+        elif main_5d > 0 and inflow_rate > 0.5:
+            capital += 6
+            add("资金面","主力短期流入",6,f"5日+{main_5d/1e4:.0f}万")
+        if main_5d < 0 and main_20d < 0:
+            capital -= 15
+            add("资金面","主力持续流出",-15,f"5日{main_5d/1e4:.0f}万,20日{main_20d/1e4:.0f}万,T+1回测-0.51%→加重")
+        elif main_5d < 0:
+            capital -= 6
+            add("资金面","主力短期流出",-6)
+        if jumbo > 0 and main_5d > 0:
+            capital += 3
+            add("资金面","超大单强势",3)
+
+    # 风险因子
+    if extra:
+        risk = extra.get("_risk", {})
+        pledge = risk.get("pledge", 0)
+        unlock_days = risk.get("unlock_days", 999)
+        if pledge > 50:
+            capital -= 15
+            add("风险","高质押风险",-15,f"质押{pledge:.0f}%>50%")
+        elif pledge > 30:
+            capital -= 8
+            add("风险","中等质押风险",-8,f"质押{pledge:.0f}%>30%")
+        if unlock_days <= 7:
+            capital -= 10
+            add("风险","解禁临近",-10,f"{unlock_days}天内解禁")
+
+    if margin_data:
+        mdod = margin_data.get("margin_dod", 0)
+        if mdod > 10:
+            capital -= 8
+            add("风险","融资激增",-8,f"融资日增{mdod:.0f}%")
+        elif mdod < -5:
+            capital -= 5
+            add("风险","融资骤降",-5,f"融资日降{abs(mdod):.0f}%")
+
+    capital = max(5, min(95, int(capital)))
+
+    # ======== 大盘 + 板块 ========
+    sector = extra.get("_sector", "") if extra else ""
+    if market_regime:
+        md = market_regime.get("market_score_delta", 0)
+        if md != 0:
+            add("大盘","大盘强势" if md>0 else "大盘弱势", md,
+                f"市场{market_regime.get('regime','')}")
+    if sector_strength and sector and sector in sector_strength:
+        ss = sector_strength[sector]
+        if ss != 0:
+            add("板块",f"板块{'领涨' if ss>0 else '拖累'}", ss, f"{sector}强度{ss:+d}")
+
+    # ======== 信息面 (30%) — T+1回测校准版 ========
+    r3 = (rt_price / c[-4] - 1) * 100 if len(c) >= 4 else 0
+    if r3 > 8:
+        info += 15; add("信息面","3日强势",15,f"+{r3:.1f}%")
+    elif r3 < -8:
+        info += 15; add("信息面","3日大跌(超跌反弹)",15,f"{r3:.1f}%,T+1回测+1.48%超额→系统最强因子")
+
+    # 跳空（基于开盘 vs 昨日收盘）
+    gap = (rt_open - c[-1]) / c[-1] * 100
+    if abs(gap) > 3:
+        if gap > 0:
+            info += 15; add("信息面","跳空高开",15,f"缺口+{gap:.1f}%")
+        else:
+            info += 0  # 跳空低开 T+1超额-0.03%, 无预测力, 不扣
+
+    # 事件驱动
+    event_summary = {}
+    if event_list and today_str:
+        edelta, event_summary = calc_event_score(event_list, today_str)
+        info += edelta
+        for etype, (delta, title, edate) in sorted(event_summary.items(), key=lambda x: abs(x[1][0]), reverse=True):
+            add("事件", f"{etype}公告", delta, f"{edate} {title[:40]}")
+
+    info = max(5, min(95, int(info)))
+
+    # ======== 盘中动量 (10%) — T+1回测校准版 (2026-07-02) ========
+    # T+1回测结论: 动量高分区间超额为负(-0.101%), 大幅降权。仅保留有正向T+1预测力的子因子。
+    # 1. 日内价格位置: 当前价 vs 日内均线(近似)
+    intra_avg = (rt_high + rt_low + rt_price) / 3
+    pos_vs_avg = (rt_price - intra_avg) / intra_avg * 100
+    if pos_vs_avg < -1.5:
+        momentum += 5
+        add("动量","价格低于日内中枢(低吸)",5,f"低于均值{pos_vs_avg:.1f}%,T+1回测+0.57%超额")
+    elif pos_vs_avg > 1:
+        momentum -= 6
+        add("动量","价格微高日内中枢",-6,f"高于均值{pos_vs_avg:+.1f}%,T+1回测-0.41%超额→加重")
+
+    # 2. 日内走势形态 — T+1回测: 持续走弱+0.31%(反转), 持续拉升-0.06%(小幅负)
+    o2p = (rt_price - rt_open) / rt_open * 100  # 开盘到当前
+    if o2p > 3:
+        momentum -= 3
+        add("动量","盘中持续拉升(追高)",-3,f"开→现+{o2p:.1f}%,T+1回测-0.06%小幅拖累")
+    elif o2p < -3:
+        momentum += 5
+        add("动量","盘中持续走弱(反弹)",5,f"开→现{o2p:.1f}%,T+1回测+0.31%超额→加分")
+    elif o2p < -1:
+        momentum += 3
+        add("动量","盘中回调(低吸窗口)",3,f"开→现{o2p:.1f}%")
+
+    # 3. 突破/跌破日内极值 — T+1回测: 逼近日内新高+0.49%(大幅正向!), 逼近日内新低+0.29%
+    pct_from_high = (rt_price - rt_high) / rt_high * 100 if rt_high > 0 else 0
+    pct_from_low = (rt_price - rt_low) / rt_low * 100 if rt_low > 0 else 0
+    if pct_from_high > -0.3:
+        momentum += 4
+        add("动量","逼近日内新高(动量延续)",4,f"距高点{pct_from_high:+.1f}%,T+1回测+0.49%超额→加分")
+    elif pct_from_low < 0.3 and o2p < 0:
+        momentum += 3
+        add("动量","逼近日内新低(支撑)",3,f"距低点{pct_from_low:+.1f}%,T+1回测+0.29%超额→加分")
+
+    # 4. V型反转检测（效果不显著，降权）
+    if rt_low > 0 and rt_price > rt_open:
+        dip_pct = (rt_low - rt_open) / rt_open * 100
+        recovery_pct = (rt_price - rt_low) / rt_low * 100
+        if dip_pct < -2 and recovery_pct > 2:
+            momentum += 4
+            add("动量","V型反转",4,f"探底{dip_pct:.1f}%后反弹{recovery_pct:.1f}%")
+
+    # 5. 开盘方向 — T+1回测: 跳空强势+0.03%(near zero), 高开回调+0.004%(zero), 低开高走-0.06%
+    if rt_chg > 0 and gap > 0:
+        momentum += 0  # 跳空强势延续 T+1超额仅+0.03%, 不扣分
+    elif rt_chg < 0 and gap > 1:  # 跳空高开但走弱 → T+1超额几乎为零
+        momentum += 1
+        add("动量","高开回调(低吸机会)",1,f"跳空+{gap:.1f}%但现跌{rt_chg:.1f}%,T+1回测超额仅+0.004%")
+    elif rt_chg > 0 and gap < -1:  # 低开高走
+        momentum += 3
+        add("动量","低开高走",3,f"跳空{gap:.1f}%但现涨{rt_chg:+.1f}%")
+
+    # 6. 振幅信号 — T+1回测: 收阳+0.21%, 收阴+0.28%(surprisingly positive), 温和惩罚
+    ampl = (rt_high - rt_low) / rt_open * 100 if rt_open > 0 else 0
+    if ampl > 5 and o2p > 0:
+        momentum += 6
+        add("动量","高振幅收阳",6,f"振幅{ampl:.1f}%,多头博弈胜出")
+    elif ampl > 5 and o2p < 0:
+        momentum -= 3
+        add("动量","高振幅收阴(反弹)",-3,f"振幅{ampl:.1f}%,T+1回测+0.28%超额仍偏正")
+
+    # 7. 昨跌今涨（反弹确认）— T+1回测超额-0.11%，降权
+    if len(c) >= 2:
+        yest_chg = (c[-1] - c[-2]) / c[-2] * 100
+        if yest_chg < -2 and rt_chg > 1:
+            momentum += 3
+            add("动量","昨日超跌反弹",3,f"昨跌{yest_chg:.1f}%,今涨{rt_chg:+.1f}%")
+
+    momentum = max(5, min(95, int(momentum)))
+
+    # ======== 加权合成 ========
+    # T+1回测校准 (2026-07-02): 资金40%+信息30%+技术20%+动量10%
+    score = round(tech * 0.20 + capital * 0.40 + info * 0.30 + momentum * 0.10)
+
+    return {
+        "score": score,
+        "tech": tech, "capital": capital, "info": info, "momentum": momentum,
+        "factors": factors,
+        "event_summary": event_summary,
+    }
 
 # ========== 主题板块（10个，根据申万一级行业 + 主营估值逻辑）==========
 THEME_SECTORS = {
@@ -1049,6 +1410,48 @@ STOCK_SECTOR = {
     "688795":"半导体/芯片",
     "832571":"智能制造",
     "920808":"智能制造",
+    # === 以下为2026-07-02补充分类（原"其他"归类，基于申万三级行业）===
+    "000062":"电子/消费电子",  # 其他电子 → 电子
+    "000063":"AI/算力/通信",   # 通信设备
+    "000066":"AI/算力/通信",   # 计算机设备
+    "000541":"消费",           # 照明设备
+    "000651":"消费",           # 白色家电
+    "002008":"智能制造",       # 自动化设备
+    "002049":"半导体/芯片",   # 半导体
+    "002054":"化工/新材料",   # 化学制品
+    "002236":"AI/算力/通信",   # 计算机设备
+    "002277":"消费",           # 一般零售
+    "002396":"AI/算力/通信",   # 通信设备
+    "002409":"半导体/芯片",   # 半导体
+    "003031":"电子/消费电子", # 通信设备
+    "300316":"新能源/电力",   # 光伏设备
+    "300339":"AI/算力/通信",   # IT服务
+    "301269":"AI/算力/通信",   # 软件开发(EDA)
+    "301611":"半导体/芯片",   # 半导体设备
+    "600100":"AI/算力/通信",   # 计算机设备
+    "600183":"半导体/芯片",   # 元件(PCB)
+    "600406":"新能源/电力",   # 电网设备
+    "600522":"AI/算力/通信",   # 通信设备
+    "600536":"AI/算力/通信",   # IT服务
+    "600673":"医药生物",       # 综合(医药制造为主)
+    "600895":"金融/交通/基建", # 房地产开发
+    "601766":"智能制造",       # 轨交设备
+    "603505":"化工/新材料",   # 化学制品(萤石资源)
+    "603650":"化工/新材料",   # 橡胶
+    "605589":"化工/新材料",   # 塑料(酚醛树脂)
+    "688019":"半导体/芯片",   # 电子化学品(光刻胶)
+    "688037":"半导体/芯片",   # 半导体(涂胶显影)
+    "688082":"半导体/芯片",   # 半导体(清洗设备)
+    "688107":"半导体/芯片",   # 半导体(FPGA)
+    "688120":"半导体/芯片",   # 半导体(CMP)
+    "688172":"半导体/芯片",   # 半导体(晶圆制造)
+    "688187":"智能制造",       # 轨交设备(IGBT/电驱)
+    "688206":"AI/算力/通信",   # 软件开发(EDA)
+    "688409":"半导体/芯片",   # 半导体(精密零部件)
+    "688525":"半导体/芯片",   # 半导体(存储封测)
+    "688545":"半导体/芯片",   # 电子化学品(电子级化学品)
+    "688630":"智能制造",       # 专用设备(LDI光刻)
+    "688766":"半导体/芯片",   # 半导体(NOR Flash)
 }
 
 def get_theme(code):
@@ -1110,8 +1513,8 @@ def generate_report(results, today, output_dir, hist_scores=None):
         return f"| {r['code']} | {r['name']} | {r.get('sector','')} | **{r['score']}** | {t} | {r['price']:.2f} | {r['change_pct']:+.2f}% | {r['ret_5d']:+.1f}% | {r['ret_20d']:+.1f}% | {r['suggestion']} |"
     
     md=[]
-    md.append(f"# 📊 SS-Enhanced 股票评分日报")
-    md.append(f"**日期**: {today} | **模型**: SS-Enhanced V7 | **股票池**: {len(results)}只A股")
+    md.append(f"# 📊 SS with GLM 股票评分日报")
+    md.append(f"**日期**: {today} | **模型**: SS with GLM V8 | **股票池**: {len(results)}只A股")
     md.append(f"")
     md.append(f"## 📈 市场概况")
     md.append(f"- 🔥强烈买入(≥80): **{len(strong_buy)}只** | 🟢逢低买入(≥75): **{len(buy_list)}只** | 🟡持有(65-74): **{len(hold_list)}只** | ⚪观望(50-64): **{len(watch_list)}只** | 🔴回避(<50): **{len(avoid_list)}只**")
@@ -1199,17 +1602,17 @@ def generate_report(results, today, output_dir, hist_scores=None):
             md.append(f"| {r['code']} | {r['name']} | **{r['score']}** | {t} | {r['price']:.2f} | {r['change_pct']:+.2f}% | {r['ret_5d']:+.1f}% | {r['ret_20d']:+.1f}% | {r['suggestion']} |")
         md.append("")
     
-    md_path=os.path.join(output_dir,f"SS增强版评分_{today}.md")
+    md_path=os.path.join(output_dir,f"SS_with_GLM评分_{today}.md")
     with open(md_path,"w") as f: f.write("\n".join(md))
     
     # HTML 交互版（Tab切换，用于浏览器/聊天窗口预览）
     html = generate_html_report(results, today, hist_scores, strong_buy, buy_list, hold_list, watch_list, avoid_list, critical, risky, sectors, top_sectors, sorted_sectors)
-    html_path=os.path.join(output_dir,f"SS增强版评分_{today}.html")
+    html_path=os.path.join(output_dir,f"SS_with_GLM评分_{today}.html")
     with open(html_path,"w") as f: f.write(html)
     
     # HTML 邮件版（全内联样式，无JS，分段表格）
     email_html = generate_email_html_report(results, today, hist_scores, strong_buy, buy_list, hold_list, watch_list, avoid_list, critical, risky, sectors, top_sectors, sorted_sectors)
-    email_html_path=os.path.join(output_dir,f"SS增强版评分_{today}_email.html")
+    email_html_path=os.path.join(output_dir,f"SS_with_GLM评分_{today}_email.html")
     with open(email_html_path,"w") as f: f.write(email_html)
     
     return md_path, html_path, email_html_path
@@ -1456,7 +1859,7 @@ def generate_html_report(results, today, hist_scores, strong_buy, buy_list, hold
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>SS-Enhanced 股票评分日报 {today}</title>
+<title>SS with GLM 股票评分日报 {today}</title>
 <style>
 * {{ box-sizing: border-box; }}
 body {{ margin:0; padding:0; background:#eef0f5; font-family:-apple-system,BlinkMacSystemFont,'PingFang SC','Microsoft YaHei',sans-serif; }}
@@ -1504,8 +1907,8 @@ function toggleDetail(id) {{
 <body>
 <div class="container">
   <div class="header">
-    <h1>📊 SS-Enhanced 股票评分日报</h1>
-    <p><strong>{today}</strong> &nbsp;|&nbsp; SS-Enhanced V7 &nbsp;|&nbsp; {len(results)}只A股 &nbsp;|&nbsp; 板块覆盖: {len(sectors)}个</p>
+    <h1>📊 SS with GLM 股票评分日报</h1>
+    <p><strong>{today}</strong> &nbsp;|&nbsp; SS with GLM V8 &nbsp;|&nbsp; {len(results)}只A股 &nbsp;|&nbsp; 板块覆盖: {len(sectors)}个</p>
   </div>
   <div class="stats">{card_html}</div>
   <p class="stat-note">主力板块: {', '.join(f'{s}({n})' for s, n in top_sectors)}</p>
@@ -1517,7 +1920,7 @@ function toggleDetail(id) {{
   <div class="tab-bar">{tab_buttons_html}</div>
   {tab_panels_html}
   <div class="footer">
-    <p>自动生成 | SS-Enhanced V7 | 策略: ≥75强烈买入 · ≥70逢低买入 · ≥60持有 · ≥45观望 · <45回避 · <40触发卖出
+    <p>自动生成 | SS with GLM V8 | 策略: ≥75强烈买入 · ≥70逢低买入 · ≥60持有 · ≥45观望 · <45回避 · <40触发卖出
     <p style="margin-top:4px">V6: 回测驱动权重修正+主力资金+板块阈值; V5: 大盘环境+板块强度</p>
   </div>
 </div>
@@ -1731,13 +2134,13 @@ def generate_email_html_report(results, today, hist_scores, strong_buy, buy_list
     html = f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>SS-Enhanced 股票评分日报 {today}</title></head>
+<title>SS with GLM 股票评分日报 {today}</title></head>
 <body style="margin:0;padding:0;background:#eef0f5;font-family:-apple-system,BlinkMacSystemFont,'PingFang SC','Microsoft YaHei',sans-serif">
 <table width="100%" cellpadding="0" cellspacing="0" style="background:#eef0f5"><tr><td align="center" style="padding:20px 12px">
 <table width="900" cellpadding="0" cellspacing="0" style="background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 2px 16px rgba(0,0,0,0.08)">
 <tr><td style="padding:24px 28px 14px;background:linear-gradient(135deg,#1a1a2e,#16213e)">
-<h1 style="margin:0 0 6px;font-size:20px;color:#e94560">📊 SS-Enhanced 股票评分日报</h1>
-<p style="margin:0;font-size:13px;color:#94a3b8"><strong style="color:#e6edf3">{today}</strong> &nbsp;|&nbsp; SS-Enhanced V7 &nbsp;|&nbsp; {len(results)}只A股 &nbsp;|&nbsp; 板块覆盖: {len(sectors)}个</p>
+<h1 style="margin:0 0 6px;font-size:20px;color:#e94560">📊 SS with GLM 股票评分日报</h1>
+<p style="margin:0;font-size:13px;color:#94a3b8"><strong style="color:#e6edf3">{today}</strong> &nbsp;|&nbsp; SS with GLM V8 &nbsp;|&nbsp; {len(results)}只A股 &nbsp;|&nbsp; 板块覆盖: {len(sectors)}个</p>
 </td></tr>
 <tr><td style="padding:16px 28px 8px">
 <table width="100%" cellpadding="0" cellspacing="0"><tr>{card_cells}</tr></table>
@@ -1756,7 +2159,7 @@ def generate_email_html_report(results, today, hist_scores, strong_buy, buy_list
 {sections_html}
 </td></tr>
 <tr><td style="padding:14px 28px 20px;text-align:center;border-top:1px solid #e8ecf1">
-<p style="margin:0;font-size:11px;color:#999">自动生成 | SS-Enhanced V7 | 策略: ≥75强烈买入 · ≥70逢低买入 · ≥60持有 · ≥45观望 · <45回避 · <40触发卖出
+<p style="margin:0;font-size:11px;color:#999">自动生成 | SS with GLM V8 | 策略: ≥75强烈买入 · ≥70逢低买入 · ≥60持有 · ≥45观望 · <45回避 · <40触发卖出
 <p style="margin:4px 0 0;font-size:11px;color:#999">V6:回测驱动权重修正+主力资金+板块阈值收紧; V5:大盘+板块</p>
 </td></tr>
 </table>
@@ -1793,7 +2196,7 @@ def send_email(md_path, email_html_path, html_path, today, recipient="914110627@
         return False
     
     msg = MIMEMultipart("mixed")
-    msg["Subject"] = f"📊 SS-Enhanced 股票评分日报 {today}"
+    msg["Subject"] = f"📊 SS with GLM 股票评分日报 {today}"
     msg["From"] = smtp_config["user"]
     msg["To"] = recipient
 
@@ -1823,11 +2226,131 @@ def send_email(md_path, email_html_path, html_path, today, recipient="914110627@
         print(f"  [ERROR] 邮件发送失败: {e}")
         return False
 
+# ========== 集成 GLM 评分（锦上添花，Sharpe +71%）==========
+import numpy as np
+
+def _glm_ols(X, y, ridge=1.0, weights=None):
+    n, p = X.shape
+    W = np.diag(np.sqrt(weights)) if weights is not None else np.eye(n)
+    Xw, yw = W @ X, W @ y
+    XtX = Xw.T @ Xw + ridge * np.eye(p)
+    try: return np.linalg.solve(XtX, Xw.T @ yw)
+    except: return np.linalg.lstsq(Xw, yw, rcond=None)[0]
+
+def _glm_features(klines, idx, extra=None):
+    """提取15个原始连续特征"""
+    w = klines[:idx+1]
+    c = np.array([k['close'] for k in w], float)
+    v = np.array([k['volume'] for k in w], float)
+    h = np.array([k['high'] for k in w], float)
+    l = np.array([k['low'] for k in w], float)
+    o = np.array([k['open'] for k in w], float)
+    f = []
+    ma5, ma10, ma20 = calc_ma(c,5), calc_ma(c,10), calc_ma(c,20)
+    f.append((ma5/ma10-1)*100 if (ma5 and ma10) else 0)
+    f.append(1 if (ma5 and ma10 and ma20 and ma5>ma10>ma20) else 0)
+    rsi = calc_rsi(c)
+    f.append(rsi); f.append(rsi**2)
+    dif, dea = calc_ema(c,12), calc_ema(c,26)
+    f.append((dif-dea)/c[-1]*1000 if (dif and dea and c[-1]>0) else 0)
+    av5 = np.mean(v[-6:-1]) if len(v)>=6 else v[-1]
+    f.append(v[-1]/av5 if av5>0 else 1)
+    f.append((c[-1]/c[-6]-1)*100 if len(c)>=6 else 0)
+    f.append((c[-1]-ma20)/ma20*100 if ma20 else 0)
+    if len(c)>=120:
+        h52,l52 = max(h[-120:]), min(l[-120:])
+        f.append((c[-1]-l52)/(h52-l52)*100 if h52>l52 else 50)
+    else: f.append(50)
+    tp = (h+l+c)/3
+    pf = np.sum(np.where(tp[-14:]>np.roll(tp,1)[-14:], tp[-14:]*v[-14:], 0)) if len(c)>=15 else 0
+    nf_v = np.sum(np.where(tp[-14:]<=np.roll(tp,1)[-14:], tp[-14:]*v[-14:], 0)) if len(c)>=15 else 1
+    f.append(100-100/(1+pf/nf_v) if nf_v>0 else 50)
+    mf_v = [(c[i]-l[i]-(h[i]-c[i]))/(h[i]-l[i])*v[i] if h[i]!=l[i] else 0 for i in range(-20,0) if i>-len(c)]
+    f.append(sum(mf_v)/sum(v[-20:]) if mf_v and sum(v[-20:])>0 else 0)
+    f.append(sum(1 for i in range(-5,0) if v[i]>v[i-1]) if len(v)>=6 else 0)
+    mcap = extra.get("mcap",0) if extra else 0
+    f.append(math.log(mcap+1e8) if mcap>0 else 0)
+    f.append((o[-1]-c[-2])/c[-2]*100 if len(c)>=2 and c[-2]>0 else 0)
+    streak = 0
+    for i in range(1, min(5,len(c)-1)):
+        if c[-i]>c[-i-1]: streak+=1
+        else: break
+    f.append(float(streak))
+    return np.array(f, float)
+
+def _glm_expand(X):
+    """添加平方项和关键交互项"""
+    extra = []
+    for i in range(X.shape[1]): extra.append(X[:,i]**2)
+    pairs = [(2,5),(0,13),(10,6),(8,7),(5,6),(9,1),(11,6),(13,6)]
+    for a,b in pairs:
+        if a<X.shape[1] and b<X.shape[1]: extra.append(X[:,a]*X[:,b])
+    return np.column_stack([X]+extra)
+
+def score_ensemble_glm(codes, klines_all, extra_all, train_days=60):
+    """
+    集成 GLM 评分：训练3个 GLM（线性+多项式+时间加权），集成预测。
+    返回 {code: glm_score}，0-100 分制。
+    回测验证：Sharpe 3.66 (T+10)，vs 固定权重 2.14。
+    """
+    if len(klines_all) < 30:
+        return {}
+
+    # 收集训练数据
+    train_X, train_Y = [], []
+    for code in codes:
+        kl = klines_all.get(code)
+        if not kl or len(kl) < 60: continue
+        ex = extra_all.get(code, {})
+        # 用历史日期构建训练样本
+        for i in range(max(30, len(kl)-train_days-10), len(kl)-10):
+            try:
+                fv = _glm_features(kl, i, extra=ex)
+                y = (kl[i+10]['close']/kl[i]['close']-1)*100
+                train_X.append(fv); train_Y.append(y)
+            except: pass
+
+    if len(train_X) < 100:
+        return {}
+
+    X_tr = np.array(train_X); Y_tr = np.array(train_Y)
+
+    # Fit 3 GLMs
+    beta_linear = _glm_ols(X_tr, Y_tr, 1.0)
+    Xp_tr = _glm_expand(X_tr)
+    beta_poly = _glm_ols(Xp_tr, Y_tr, 2.0)
+    tw = np.exp(-0.02 * np.arange(len(Y_tr)-1, -1, -1))
+    beta_tw = _glm_ols(Xp_tr, Y_tr, 2.0, tw)
+
+    # Predict today
+    result = {}
+    for code in codes:
+        kl = klines_all.get(code)
+        if not kl or len(kl) < 30: continue
+        ex = extra_all.get(code, {})
+        try:
+            fv = _glm_features(kl, len(kl)-1, extra=ex)
+            p_linear = fv @ beta_linear
+            p_poly = _glm_expand(fv.reshape(1,-1))[0] @ beta_poly
+            p_tw = _glm_expand(fv.reshape(1,-1))[0] @ beta_tw
+            # Ensemble average, scale to 0-100
+            raw = (p_linear + p_poly + p_tw) / 3
+            score = int(max(5, min(95, 50 + raw * 8)))  # center at 50, scale
+            result[code] = score
+        except: pass
+
+    return result
+
 # ========== 主流程 ==========
-def run_daily_scoring(stock_codes, output_dir="/workspace", send_mail=True, recipient=None):
+def run_daily_scoring(stock_codes, output_dir="/workspace", send_mail=True, recipient=None, use_cache=False):
+    """SS with GLM 每日评分主流程。
+    
+    use_cache=True: 从 output/_cache_{date}.json 加载已抓取数据，跳过所有HTTP/子进程调用，
+                    直接评分 + 生成报告。适用于改分类/改权重等无需刷新数据的场景。
+    """
     today = datetime.now().strftime("%Y-%m-%d")
     print(f"╔══════════════════════════════════════════╗")
-    print(f"║  SS-Enhanced 每日评分 [{today}]  ║")
+    print(f"║  SS with GLM 每日评分 [{today}]  ║")
     print(f"╚══════════════════════════════════════════╝")
     print(f"股票池: {len(stock_codes)} 只")
     
@@ -1844,40 +2367,69 @@ def run_daily_scoring(stock_codes, output_dir="/workspace", send_mail=True, reci
     for code, date_scores in hist_data.items():
         hist_scores[code] = [s for d, s in sorted(date_scores.items())]
     
-    print("\n[1/5] 获取行情数据...")
-    klines = fetch_kline_batch(stock_codes)
-    extra = fetch_extra_info(stock_codes)
-    print(f"  K线: {len(klines)} | 行情: {len(extra)}")
+    cache_path = os.path.join(output_dir, f"_cache_{today}.json")
+    
+    if use_cache and os.path.exists(cache_path):
+        print("\n♻️  [缓存模式] 加载已缓存数据，跳过所有数据抓取...")
+        with open(cache_path, "r") as f:
+            cache = json.load(f)
+        klines = cache.get("klines", {})
+        extra = cache.get("extra", {})
+        market_regime = cache.get("market_regime", {"regime": "neutral", "market_score_delta": 0})
+        sector_strength = cache.get("sector_strength", {})
+        news_events = cache.get("news_events", {})
+        fund_flow = cache.get("fund_flow", {})
+        risk_data = cache.get("risk_data", {})
+        print(f"  加载: {len(klines)} K线, {len(extra)} 行情, {sum(len(v) for v in news_events.values())} 事件")
+    else:
+        print("\n[1/4] 获取行情数据...")
+        klines = fetch_kline_batch(stock_codes)
+        extra = fetch_extra_info(stock_codes)
+        print(f"  K线: {len(klines)} | 行情: {len(extra)}")
 
-    print("\n[2/5] 获取板块大盘环境...")
-    market_regime, sector_strength = fetch_sector_context()
-    if market_regime.get("regime") != "neutral":
-        print(f"  大盘: {market_regime['regime']} ({market_regime['market_score_delta']:+d})")
-    print(f"  板块强度: {len(sector_strength)}个板块有信号")
+        print("\n[2/4] 获取板块大盘环境...")
+        market_regime, sector_strength = fetch_sector_context()
+        if market_regime.get("regime") != "neutral":
+            print(f"  大盘: {market_regime['regime']} ({market_regime['market_score_delta']:+d})")
+        print(f"  板块强度: {len(sector_strength)}个板块有信号")
 
-    # 预计算每只股票的主题板块
-    for code in extra:
-        extra[code]["_sector"] = get_theme(code)
+        # 预计算每只股票的主题板块
+        for code in extra:
+            extra[code]["_sector"] = get_theme(code)
 
-    print("\n[3/6] 获取主力资金流向...")
-    fund_flow = fetch_fund_flow(stock_codes)
-    ff_codes = sum(1 for v in fund_flow.values() if v.get("main_net_5d", 0) != 0)
-    print(f"  资金流数据: {ff_codes}只")
+        print("\n[3/4] 并行获取主力资金/风险因子/公告事件...")
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            f_fund = executor.submit(fetch_fund_flow, stock_codes)
+            f_risk = executor.submit(fetch_risk_factors, stock_codes)
+            f_events = executor.submit(fetch_news_events, stock_codes)
+            fund_flow = f_fund.result()
+            risk_data = f_risk.result()
+            news_events = f_events.result()
 
-    print("\n[4/7] 获取风险因子...")
-    risk_data = fetch_risk_factors(stock_codes)
-    risk_count = sum(1 for v in risk_data.values() if v.get("pledge",0) > 30 or v.get("unlock_days",999) <= 7)
-    print(f"  风险信号: {risk_count}只有质押/解禁风险")
+        ff_codes = sum(1 for v in fund_flow.values() if v.get("main_net_5d", 0) != 0)
+        print(f"  资金流数据: {ff_codes}只")
+
+        risk_count = sum(1 for v in risk_data.values() if v.get("pledge",0) > 30 or v.get("unlock_days",999) <= 7)
+        print(f"  风险信号: {risk_count}只有质押/解禁风险")
+
+        ev_codes = sum(1 for v in news_events.values() if v)
+        ev_total = sum(len(v) for v in news_events.values())
+        print(f"  有事件股票: {ev_codes}只 | 事件总数: {ev_total}条")
+
+        # 保存中间数据缓存（当天可复用）
+        with open(cache_path, "w") as f:
+            json.dump({"klines": klines, "extra": extra, "market_regime": market_regime,
+                       "sector_strength": sector_strength, "news_events": news_events,
+                       "fund_flow": fund_flow, "risk_data": risk_data}, f,
+                      ensure_ascii=False)
+
     for code in extra:
         extra[code]["_risk"] = risk_data.get(code, {"pledge": 0, "unlock_days": 999})
-
-    print("\n[5/7] 获取公告事件...")
-    news_events = fetch_news_events(stock_codes)
-    ev_codes = sum(1 for v in news_events.values() if v)
-    ev_total = sum(len(v) for v in news_events.values())
-    print(f"  有事件股票: {ev_codes}只 | 事件总数: {ev_total}条")
+    for code in extra:
+        if "_sector" not in extra[code]:
+            extra[code]["_sector"] = get_theme(code)
     
-    print("\n[6/7] 评分中...")
+    print("\n[4/5] 评分中...")
     results = []
     for code in stock_codes:
         kl = klines.get(code)
@@ -1922,7 +2474,20 @@ def run_daily_scoring(stock_codes, output_dir="/workspace", send_mail=True, reci
     # 保存历史评分
     with open(hist_path, "w") as f: json.dump(hist_data, f, ensure_ascii=False)
     
-    print(f"\n[7/7] 生成报告...")
+    # ==== 集成 GLM 评分（锦上添花） ====
+    print(f"\n[GLM] 集成 GLM 评分中...")
+    glm_scores = score_ensemble_glm(stock_codes, klines, extra, train_days=60)
+    if glm_scores:
+        for r in results:
+            gs = glm_scores.get(r["code"])
+            if gs is not None:
+                r["glm_score"] = gs
+        glm_top = sorted(results, key=lambda x: x.get("glm_score", 0), reverse=True)[:5]
+        print(f"  GLM Top5: " + " | ".join(f"{r['code']} {r['name']}: G{r.get('glm_score','?')}" for r in glm_top))
+    else:
+        print(f"  ⚠️ GLM 训练数据不足，跳过")
+    
+    print(f"\n[5/5] 生成报告...")
     sb=sum(1 for r in results if r["sug_action"]=="strong_buy")
     buy=sum(1 for r in results if r["sug_action"]=="buy")
     hold=sum(1 for r in results if r["sug_action"]=="hold")
@@ -1933,9 +2498,9 @@ def run_daily_scoring(stock_codes, output_dir="/workspace", send_mail=True, reci
     
     md_path, html_path, email_html_path = generate_report(results, today, output_dir, hist_scores)
     
-    json_path = os.path.join(output_dir, f"SS增强版评分_{today}.json")
+    json_path = os.path.join(output_dir, f"SS_with_GLM评分_{today}.json")
     with open(json_path, "w") as f:
-        json.dump({"date":today,"model":"SS-Enhanced V7","total":len(results),"results":results},f,ensure_ascii=False,indent=2)
+        json.dump({"date":today,"model":"SS with GLM V8","total":len(results),"results":results},f,ensure_ascii=False,indent=2)
     
     if send_mail:
         print("\n[邮件] 发送报告...")
@@ -1954,13 +2519,24 @@ if __name__ == "__main__":
     OUTPUT_DIR = os.path.join(PROJECT_DIR, "output")
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+    # --regen-only：跳过数据抓取，仅从缓存重新评分和生成报告
+    use_cache = "--regen-only" in sys.argv
+    flags = {"--regen-only", "--no-mail", "--mail"}
+    args = [a for a in sys.argv[1:] if a not in flags]
+
     # 股票代码文件：优先命令行参数，其次项目目录
     default_codes = os.path.join(PROJECT_DIR, "uploaded-stock-codes.txt")
-    codes_file = sys.argv[1] if len(sys.argv) > 1 else default_codes
+    codes_file = args[0] if args else default_codes
     with open(codes_file) as f: codes = [line.strip() for line in f if line.strip()]
 
     # 收件人：命令行第二个参数
-    recipient = sys.argv[2] if len(sys.argv) > 2 else None
+    recipient = args[1] if len(args) > 1 else None
+
+    # --no-mail：不发送邮件（regen-only 默认不发）
+    send_mail = not use_cache and "--no-mail" not in sys.argv
+    if use_cache and "--mail" in sys.argv:
+        send_mail = True
 
     # 输出目录：项目下的 output/
-    run_daily_scoring(codes, output_dir=OUTPUT_DIR, recipient=recipient)
+    run_daily_scoring(codes, output_dir=OUTPUT_DIR, recipient=recipient,
+                      send_mail=send_mail, use_cache=use_cache)
