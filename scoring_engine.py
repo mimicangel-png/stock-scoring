@@ -1996,6 +1996,11 @@ body {{ margin:0; padding:0; background:#eef0f5; font-family:-apple-system,Blink
 .table-wrap tbody tr:hover {{ background:#eef2ff !important; }}
 .footer {{ padding:14px 28px 20px; text-align:center; border-top:1px solid #e8ecf1; }}
 .footer p {{ margin:0; font-size:11px; color:#999; }}
+.guide-card {{ margin:8px 28px; padding:12px 16px; background:#f8fafc; border:1px solid #e2e8f0; border-radius:8px; font-size:12px; line-height:1.7; }}
+.guide-card b {{ color:#1a1a2e; }}
+.guide-card .ss-tag {{ display:inline-block;padding:1px 6px;border-radius:4px;background:#fef3c7;font-weight:600;font-size:11px; }}
+.guide-card .glm-tag {{ display:inline-block;padding:1px 6px;border-radius:4px;background:#ede9fe;color:#6b21a8;font-weight:600;font-size:11px; }}
+.guide-card .both-tag {{ display:inline-block;padding:1px 6px;border-radius:4px;background:#dcfce7;color:#166534;font-weight:600;font-size:11px; }}
 </style>
 <script>
 function switchTab(idx) {{
@@ -2034,6 +2039,13 @@ function sortTable(col) {{
   </div>
   <div class="stats">{card_html}</div>
   <p class="stat-note">主力板块: {', '.join(f'{s}({n})' for s, n in top_sectors)}</p>
+  <div class="guide-card">
+    <b>📖 双模型解读</b><br>
+    <span class="ss-tag">SS分</span> <b>固定规则打分</b>：基于 35%技术 + 55%资金 + 5%信息 + 5%事件，手设因子阈值。<br>
+    <span class="glm-tag">GLM分</span> <b>数据学习打分</b>：每天从近60天数据自动学习15个特征的权重，回测 Sharpe 3.66（vs SS的2.14）。<br>
+    <span class="both-tag">共识</span> = 两模型都看好/看空，信任度最高。 <b>单模型信号</b> = 一方看好另一方中性，需结合展开详情判断。<br>
+    <span style="color:#888">💡 建议关注 <span class="glm-tag">G≥70</span> 且 <span class="ss-tag">SS≥60</span> 的标的，或 <span class="both-tag">共识买入</span> 信号。</span>
+  </div>
   <div class="summary">
     <div class="top5"><h3 style="color:#92400e">🔥 SS 最佳 TOP 5</h3>{top5_summary}</div>
     <div class="top5"><h3 style="color:#6b21a8">🧠 GLM 集成 TOP 5 (Sharpe 3.66)</h3>{glm_top5 or "<span style='color:#999;font-size:12px'>GLM 评分暂未生成</span>"}</div>
