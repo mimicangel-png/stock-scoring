@@ -1459,7 +1459,7 @@ def get_theme(code):
     return STOCK_SECTOR.get(code, "其他")
 
 # ========== 生成报告 ==========
-def generate_report(results, today, output_dir, hist_scores=None):
+def generate_report(results, today, output_dir, hist_scores=None, glm_hist=None):
     if hist_scores is None: hist_scores = {}
     
     def trend_str(code):
@@ -1606,7 +1606,7 @@ def generate_report(results, today, output_dir, hist_scores=None):
     with open(md_path,"w") as f: f.write("\n".join(md))
     
     # HTML 交互版（Tab切换，用于浏览器/聊天窗口预览）
-    html = generate_html_report(results, today, hist_scores, strong_buy, buy_list, hold_list, watch_list, avoid_list, critical, risky, sectors, top_sectors, sorted_sectors)
+    html = generate_html_report(results, today, hist_scores, glm_hist, strong_buy, buy_list, hold_list, watch_list, avoid_list, critical, risky, sectors, top_sectors, sorted_sectors)
     html_path=os.path.join(output_dir,f"SS增强版评分_{today}.html")
     with open(html_path,"w") as f: f.write(html)
     
@@ -1618,8 +1618,8 @@ def generate_report(results, today, output_dir, hist_scores=None):
     return md_path, html_path, email_html_path
 
 
-def generate_html_report(results, today, hist_scores, strong_buy, buy_list, hold_list, watch_list, avoid_list, critical, risky, sectors, top_sectors, sorted_sectors):
-    """生成带Tab切换的HTML报告（斑马纹、固定列宽、板块分sheet）"""
+def generate_html_report(results, today, hist_scores, glm_hist, strong_buy, buy_list, hold_list, watch_list, avoid_list, critical, risky, sectors, top_sectors, sorted_sectors):
+    """生成HTML报告（双栏SS/GLM + 点击排序 + 共识默认排序）"""
 
     def trend_str(code):
         scores = hist_scores.get(code, [])
@@ -1724,20 +1724,34 @@ def generate_html_report(results, today, hist_scores, strong_buy, buy_list, hold
         tc = trend_color(t)
         badge, sug_color = score_badge(r["score"])
         glm_s = r.get("glm_score")
-        glm_badge = f'<span style="display:inline-block;min-width:24px;padding:2px 6px;border-radius:4px;background:#ede9fe;color:#6b21a8;font-weight:600;font-size:11px;margin-left:4px">{glm_s}</span>' if glm_s else ""
+        glm_badge = f'<span style="display:inline-block;min-width:24px;padding:2px 6px;border-radius:4px;background:#ede9fe;color:#6b21a8;font-weight:600;font-size:12px">{glm_s}</span>' if glm_s else '<span style="color:#ccc;font-size:11px">-</span>'
+        # GLM trend
+        gscores = glm_hist.get(r["code"], [])
+        gt = "-"
+        if len(gscores) >= 2:
+            gr = [int(s) for s in gscores[-5:]]
+            gd = []
+            for s in gr:
+                if not gd or s != gd[-1]: gd.append(s)
+            if len(gd) >= 2:
+                ga = "↑" if gd[-1] > gd[-2] else ("↓" if gd[-1] < gd[-2] else "→")
+                gt = "→".join(str(s) for s in gd) + f" {ga}"
+            else:
+                gt = str(gd[0]) if gd else "-"
+        gtc = "#16a34a" if gt.endswith("↑") else ("#dc2626" if gt.endswith("↓") else "#888")
         bg = "#f8f9fc" if row_idx % 2 == 0 else "#ffffff"
         price = f'{r["price"]:.2f}'
-        cp = pct_color(r["change_pct"])
-        r5 = pct_color(r["ret_5d"])
-        r20 = pct_color(r["ret_20d"])
+        cp = pct_color(r["change_pct"]); r5 = pct_color(r["ret_5d"]); r20 = pct_color(r["ret_20d"])
         detail_id = f"detail-{r['code']}-{row_idx}"
-        main_row = f"""<tr style="background:{bg};cursor:pointer" onclick="toggleDetail('{detail_id}')">
+        main_row = f"""<tr class="main-row" style="background:{bg};cursor:pointer" onclick="toggleDetail('{detail_id}')">
 <td style="{TD_BASE};text-align:center;font-size:14px">📊</td>
 <td style="{TD_BASE}">{r['code']}</td>
 <td style="{TD_BASE};font-weight:500">{r['name']}</td>
 <td style="{TD_BASE}">{r.get('sector','')}</td>
-<td style="{TD_BASE};text-align:center">{badge}{glm_badge}</td>
+<td style="{TD_BASE};text-align:center">{badge}</td>
+<td style="{TD_BASE};text-align:center">{glm_badge}</td>
 <td style="{TD_BASE};color:{tc};font-size:12px">{t}</td>
+<td style="{TD_BASE};color:{gtc};font-size:12px">{gt}</td>
 <td style="{TD_NUM}">{price}</td>
 <td style="{TD_NUM};{cp}">{r['change_pct']:+.2f}%</td>
 <td style="{TD_NUM};{r5}">{r['ret_5d']:+.1f}%</td>
@@ -1745,14 +1759,14 @@ def generate_html_report(results, today, hist_scores, strong_buy, buy_list, hold
 <td style="{TD_BASE};color:{sug_color};font-weight:600;font-size:12px">{r['suggestion']}</td>
 </tr>"""
         detail_row = f"""<tr id="{detail_id}" style="display:none">
-<td colspan="11" style="padding:12px 16px;background:#f8f9fc;border-bottom:2px solid #e8ecf1">
+<td colspan="13" style="padding:12px 16px;background:#f8f9fc;border-bottom:2px solid #e8ecf1">
 {make_factors_detail_html(r)}
 </td></tr>"""
         return main_row + "\n" + detail_row
 
     def make_table_html(stocks):
         """生成一个完整表格的 tbody HTML"""
-        sorted_stocks = sorted(stocks, key=lambda x: x["score"], reverse=True)
+        sorted_stocks = sorted(stocks, key=lambda x: -(x["score"] + x.get("glm_score", 0)))
         rows = []
         for i, r in enumerate(sorted_stocks):
             rows.append(make_row_html(r, i))
@@ -1782,16 +1796,18 @@ def generate_html_report(results, today, hist_scores, strong_buy, buy_list, hold
     # ---- 生成各Tab内容面板HTML ----
     tab_panels = []
     colgroup = """<colgroup>
-<col style="width:32px"><col style="width:62px"><col style="width:72px"><col style="width:110px"><col style="width:52px">
-<col style="width:150px"><col style="width:64px"><col style="width:60px"><col style="width:56px"><col style="width:56px"><col style="width:80px">
+<col style="width:32px"><col style="width:62px"><col style="width:72px"><col style="width:110px"><col style="width:52px"><col style="width:52px">
+<col style="width:120px"><col style="width:120px"><col style="width:64px"><col style="width:60px"><col style="width:56px"><col style="width:56px"><col style="width:80px">
 </colgroup>"""
     thead = f"""<thead><tr>
 <th style="{TH_BASE};text-align:center">分析</th>
-<th style="{TH_BASE};text-align:center">代码</th>
-<th style="{TH_BASE}">名称</th>
+<th style="{TH_BASE};text-align:center;cursor:pointer" onclick="sortTable(1)">代码</th>
+<th style="{TH_BASE};cursor:pointer" onclick="sortTable(2)">名称</th>
 <th style="{TH_BASE}">概念板块</th>
-<th style="{TH_BASE};text-align:center">SS / GLM</th>
-<th style="{TH_BASE}">5日评分趋势</th>
+<th style="{TH_BASE};text-align:center;cursor:pointer" onclick="sortTable(4)">SS分 ▼</th>
+<th style="{TH_BASE};text-align:center;cursor:pointer" onclick="sortTable(5)">GLM分</th>
+<th style="{TH_BASE};cursor:pointer" onclick="sortTable(6)">SS趋势</th>
+<th style="{TH_BASE};cursor:pointer" onclick="sortTable(7)">GLM趋势</th>
 <th style="{TH_BASE};text-align:right">收盘价</th>
 <th style="{TH_BASE};text-align:right">日涨跌</th>
 <th style="{TH_BASE};text-align:right">5日涨跌</th>
@@ -1910,6 +1926,24 @@ function switchTab(idx) {{
 function toggleDetail(id) {{
   var el = document.getElementById(id);
   if (el) el.style.display = el.style.display === 'none' ? '' : 'none';
+}}
+var sortCol = 4; var sortAsc = false;
+function sortTable(col) {{
+  if (col === sortCol) sortAsc = !sortAsc; else {{ sortCol = col; sortAsc = (col !== 4); }}
+  var tables = document.querySelectorAll('.table-wrap tbody');
+  tables.forEach(function(tbody) {{
+    var rows = Array.from(tbody.querySelectorAll('tr.main-row'));
+    rows.sort(function(a,b) {{
+      var ca = (a.cells[col]||{{}}).textContent||'';
+      var cb = (b.cells[col]||{{}}).textContent||'';
+      var va = parseFloat(ca.replace(/[^0-9.-]/g,''));
+      var vb = parseFloat(cb.replace(/[^0-9.-]/g,''));
+      if (!isNaN(va) && !isNaN(vb)) return sortAsc ? va-vb : vb-va;
+      return sortAsc ? ca.localeCompare(cb) : cb.localeCompare(ca);
+    }});
+    rows.forEach(function(r,i) {{ r.style.background = i%2 ? '#ffffff' : '#f8f9fc'; }});
+    rows.forEach(function(r) {{ tbody.appendChild(r); }});
+  }});
 }}
 </script>
 </head>
@@ -2504,15 +2538,25 @@ def run_daily_scoring(stock_codes, output_dir="/workspace", send_mail=True, reci
     # ==== 集成 GLM 评分（锦上添花） ====
     print(f"\n[GLM] 集成 GLM 评分中...")
     glm_scores = score_ensemble_glm(stock_codes, klines, extra, train_days=60)
+    glm_hist = {}  # {code: [score_list]} for GLM trend display
     if glm_scores:
         for r in results:
             gs = glm_scores.get(r["code"])
             if gs is not None:
                 r["glm_score"] = gs
+                # Save GLM history (separate file)
+                code_glm_key = f"glm_{r['code']}"
+                if code_glm_key not in hist_data: hist_data[code_glm_key] = {}
+                hist_data[code_glm_key][today] = gs
         glm_top = sorted(results, key=lambda x: x.get("glm_score", 0), reverse=True)[:5]
         print(f"  GLM Top5: " + " | ".join(f"{r['code']} {r['name']}: G{r.get('glm_score','?')}" for r in glm_top))
     else:
         print(f"  ⚠️ GLM 训练数据不足，跳过")
+    # Convert GLM history for trend display
+    for key, date_scores in hist_data.items():
+        if key.startswith("glm_"):
+            code = key[4:]
+            glm_hist[code] = [s for d, s in sorted(date_scores.items())]
     
     print(f"\n[5/5] 生成报告...")
     sb=sum(1 for r in results if r["sug_action"]=="strong_buy")
@@ -2523,7 +2567,7 @@ def run_daily_scoring(stock_codes, output_dir="/workspace", send_mail=True, reci
     critical=sum(1 for r in results if r["score"]<40)
     print(f"  🔥强烈买入:{sb} 🟢逢低买入:{buy} 🟡持有:{hold} ⚪观望:{watch} 🔴回避:{avoid} 🚨触发卖出:{critical}")
     
-    md_path, html_path, email_html_path = generate_report(results, today, output_dir, hist_scores)
+    md_path, html_path, email_html_path = generate_report(results, today, output_dir, hist_scores, glm_hist=glm_hist)
     
     json_path = os.path.join(output_dir, f"SS增强版评分_{today}.json")
     with open(json_path, "w") as f:
