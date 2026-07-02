@@ -856,6 +856,50 @@ def get_suggestion(score):
     elif score>=45: return "⚪观望","watch"
     else: return "🔴回避","avoid"
 
+def get_combined_suggestion(ss_score, glm_score):
+    """双模型共识/分歧建议"""
+    if ss_score is None: ss_score = 0
+    
+    ss_level = 5 if ss_score>=75 else 4 if ss_score>=70 else 3 if ss_score>=60 else 2 if ss_score>=45 else 1
+    glm_level = 5 if glm_score>=75 and glm_score else 4 if glm_score and glm_score>=70 else 3 if glm_score and glm_score>=60 else 2 if glm_score and glm_score>=45 else 1 if glm_score else 0
+    
+    # No GLM
+    if glm_level == 0:
+        return get_suggestion(ss_score)[0] if ss_score else "⚪观望", "ss_only"
+    
+    # Consensus buy
+    if ss_level >= 4 and glm_level >= 4:
+        return "🔥 共识强买", "consensus_buy" if ss_level==5 and glm_level==5 else ("🟢 共识逢买", "consensus_buy")
+    if (ss_level >= 4 and glm_level >= 4) and (ss_level==5 or glm_level==5):
+        return "🔥 共识强买", "consensus_buy"
+    
+    # Consensus sell
+    if ss_level <= 1 and glm_level <= 1:
+        return "🚨 共识卖出", "consensus_sell"
+    
+    # SS leads buy
+    if ss_level >= 4 and glm_level < 4:
+        return "⚡ SS建议买入", "ss_buy"
+    if ss_level >= 3 and glm_level < 2:
+        return "💡 SS偏乐观", "ss_lean"
+    
+    # GLM leads buy
+    if glm_level >= 4 and ss_level < 4:
+        return "🧠 GLM建议买入", "glm_buy"
+    if glm_level >= 3 and ss_level < 2:
+        return "💡 GLM偏乐观", "glm_lean"
+    
+    # SS leads sell
+    if ss_level <= 1 and glm_level > 2:
+        return "⚠️ SS建议回避", "ss_sell"
+    
+    # GLM leads sell
+    if glm_level <= 1 and ss_level > 2:
+        return "⚠️ GLM建议回避", "glm_sell"
+    
+    # Both middle/neutral
+    return "🟡 双方观望", "neutral"
+
 def get_suggestion_intraday(score):
     """盘中建议阈值（T+1回测校准版 2026-07-02）"""
     if score>=68: return "🔥强烈买入","strong_buy"
@@ -2571,17 +2615,23 @@ def run_daily_scoring(stock_codes, output_dir="/workspace", send_mail=True, reci
         if key.startswith("glm_"):
             glm_hist[key[4:]] = [s for d, s in sorted(date_scores.items())]
     
+    # ==== 双模型共识/分歧建议 ====
+    if glm_scores:
+        for r in results:
+            gs = r.get("glm_score")
+            if gs is not None:
+                combined, action = get_combined_suggestion(r["score"], gs)
+                r["suggestion"] = combined
+                r["sug_action"] = action
     # 保存历史评分
     with open(hist_path, "w") as f: json.dump(hist_data, f, ensure_ascii=False)
     
     print(f"\n[5/5] 生成报告...")
-    sb=sum(1 for r in results if r["sug_action"]=="strong_buy")
-    buy=sum(1 for r in results if r["sug_action"]=="buy")
-    hold=sum(1 for r in results if r["sug_action"]=="hold")
-    watch=sum(1 for r in results if r["sug_action"]=="watch")
-    avoid=sum(1 for r in results if r["sug_action"]=="avoid")
-    critical=sum(1 for r in results if r["score"]<40)
-    print(f"  🔥强烈买入:{sb} 🟢逢低买入:{buy} 🟡持有:{hold} ⚪观望:{watch} 🔴回避:{avoid} 🚨触发卖出:{critical}")
+    consensus_buy = sum(1 for r in results if "共识强买" in r.get("suggestion","") or "共识逢买" in r.get("suggestion",""))
+    consensus_sell = sum(1 for r in results if "共识卖出" in r.get("suggestion",""))
+    ss_suggest = sum(1 for r in results if "SS" in r.get("suggestion",""))
+    glm_suggest = sum(1 for r in results if "GLM" in r.get("suggestion",""))
+    print(f"  🔥共识买入:{consensus_buy} | 🚨共识卖出:{consensus_sell} | ⚡SS建议:{ss_suggest} | 🧠GLM建议:{glm_suggest}")
     
     md_path, html_path, email_html_path = generate_report(results, today, output_dir, hist_scores, glm_hist=glm_hist)
     
