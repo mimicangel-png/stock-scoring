@@ -1716,7 +1716,7 @@ def generate_html_report(results, today, hist_scores, glm_hist, strong_buy, buy_
         caps = [f for f in factors if f["delta"] == 0]
         parts = []
         # 维度分值
-        parts.append(f'<div style="margin-bottom:8px"><span style="font-size:12px;color:#666;margin-right:12px">技术面 <b style="color:#1a1a2e;font-size:14px">{r.get("tech",50)}</b></span><span style="font-size:12px;color:#666;margin-right:12px">资金面 <b style="color:#1a1a2e;font-size:14px">{r.get("capital",50)}</b></span><span style="font-size:12px;color:#666">信息面 <b style="color:#1a1a2e;font-size:14px">{r.get("info",50)}</b></span><span style="font-size:12px;color:#888;margin-left:12px">权重: 技术40% · 资金40% · 信息20%</span></div>')
+        parts.append(f'<div style="margin-bottom:8px"><span style="font-size:12px;color:#666;margin-right:12px">技术面 <b style="color:#1a1a2e;font-size:14px">{r.get("tech",50)}</b></span><span style="font-size:12px;color:#666;margin-right:12px">资金面 <b style="color:#1a1a2e;font-size:14px">{r.get("capital",50)}</b></span><span style="font-size:12px;color:#666">信息面 <b style="color:#1a1a2e;font-size:14px">{r.get("info",50)}</b></span><span style="font-size:12px;color:#888;margin-left:12px">权重: 技术35% · 资金55% · 信息5% · 事件5%</span></div>')
         # 关键事件
         event_summary = r.get("event_summary", {})
         events = r.get("events", [])
@@ -1758,6 +1758,24 @@ def generate_html_report(results, today, hist_scores, glm_hist, strong_buy, buy_
             for f in caps:
                 tags.append(f'<span style="display:inline-block;margin:2px 4px;padding:3px 10px;border-radius:6px;background:#fff3cd;color:#856404;font-size:12px">{f["name"]}<span style="color:#888;font-size:11px;margin-left:4px">{f["detail"]}</span></span>')
             parts.append(f'<div>{"".join(tags)}</div>')
+        # GLM 因子贡献（线性模型可解释性）
+        glm_fs = r.get("glm_factors", [])
+        if glm_fs:
+            parts.append('<div style="margin-top:8px;padding-top:6px;border-top:1px solid #e2e8f0">')
+            parts.append('<span style="font-size:12px;color:#6b21a8;font-weight:600">🧠 GLM 因子贡献 (线性模型, G分={})</span>'.format(r.get("glm_score","?")))
+            pos_g = [(n,v,c) for n,v,c in glm_fs[:6] if c > 0]
+            neg_g = [(n,v,c) for n,v,c in glm_fs[:6] if c < 0]
+            if pos_g:
+                tags = []
+                for n, v, c in pos_g[:3]:
+                    tags.append(f'<span style="display:inline-block;margin:2px 4px;padding:3px 10px;border-radius:6px;background:#ede9fe;color:#6b21a8;font-size:12px">{n} <b>+{c:.2f}</b><span style="color:#888;font-size:10px;margin-left:4px">val={v:.3f}</span></span>')
+                parts.append(f'<div style="margin-bottom:4px"><span style="font-size:11px;color:#7c3aed">🟣 正向驱动</span></div><div>{"".join(tags)}</div>')
+            if neg_g:
+                tags = []
+                for n, v, c in neg_g[:3]:
+                    tags.append(f'<span style="display:inline-block;margin:2px 4px;padding:3px 10px;border-radius:6px;background:#f3e8ff;color:#7c3aed;font-size:12px">{n} <b>{c:.2f}</b><span style="color:#888;font-size:10px;margin-left:4px">val={v:.3f}</span></span>')
+                parts.append(f'<div style="margin-top:4px"><span style="font-size:11px;color:#a855f7">⚫ 负向拖累</span></div><div>{"".join(tags)}</div>')
+            parts.append('</div>')
         return "".join(parts)
 
     def make_row_html(r, row_idx):
@@ -2433,8 +2451,10 @@ def score_ensemble_glm(codes, klines_all, extra_all, train_days=60):
 
     # Predict today
     result = {}
-    raw_vals = []
-    code_order = []
+    glm_detail = {}  # {code: [(name, value, contribution), ...]}
+    feat_names = ["趋势偏离","均线多头","RSI","RSI²","MACD","量比5日","5日涨幅","MA20偏离",
+                  "52周位置","MFI","CMF","放量天数","log市值","跳空缺口","连涨"]
+    raw_vals = []; code_order = []
     for code in codes:
         kl = klines_all.get(code)
         if not kl or len(kl) < 30: continue
@@ -2447,6 +2467,10 @@ def score_ensemble_glm(codes, klines_all, extra_all, train_days=60):
             raw = (p_linear + p_poly + p_tw) / 3
             raw_vals.append(raw)
             code_order.append(code)
+            # Per-feature contributions (linear model for interpretability)
+            conts = [(feat_names[i], float(fv[i]), float(fv[i] * beta_linear[i]))
+                     for i in range(min(len(feat_names), len(beta_linear)))]
+            glm_detail[code] = sorted(conts, key=lambda x: abs(x[2]), reverse=True)[:12]
         except: pass
 
     # Normalize: use robust Z-score + sigmoid to 5-95
@@ -2463,7 +2487,7 @@ def score_ensemble_glm(codes, klines_all, extra_all, train_days=60):
         score = int(5 + (normalized + 3) / 6 * 90)  # [-3,3] → [5,95]
         result[code] = score
 
-    return result
+    return result, glm_detail
 
 # ========== 主流程 ==========
 def run_daily_scoring(stock_codes, output_dir="/workspace", send_mail=True, recipient=None, use_cache=False):
@@ -2597,13 +2621,14 @@ def run_daily_scoring(stock_codes, output_dir="/workspace", send_mail=True, reci
     
     # ==== 集成 GLM 评分（锦上添花） ====
     print(f"\n[GLM] 集成 GLM 评分中...")
-    glm_scores = score_ensemble_glm(stock_codes, klines, extra, train_days=60)
+    glm_scores, glm_detail = score_ensemble_glm(stock_codes, klines, extra, train_days=60)
     glm_hist = {}
     if glm_scores:
         for r in results:
             gs = glm_scores.get(r["code"])
             if gs is not None:
                 r["glm_score"] = gs
+                r["glm_factors"] = glm_detail.get(r["code"], [])
                 code_glm_key = f"glm_{r['code']}"
                 if code_glm_key not in hist_data: hist_data[code_glm_key] = {}
                 hist_data[code_glm_key][today] = gs
