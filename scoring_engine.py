@@ -1876,7 +1876,26 @@ def generate_html_report(results, today, hist_scores, glm_hist, strong_buy, buy_
     fallers_summary = ""
     for r in fallers:
         d = score_delta(r["code"])
-        fallers_summary += f'<span style="display:inline-block;margin:3px 6px 3px 0;padding:3px 10px;border-radius:8px;background:#fef2f2;font-size:12px;color:#dc2626;font-weight:600">{r["code"]} {r["name"]} <b>{r["score"]}</b> {d}</span>'
+        fallers_summary += f'<span style="display:inline-block;margin:3px 6px 3px 0;padding:3px 10px;border-radius:8px;background:#fee2e2;font-size:12px;color:#dc2626;font-weight:600">{r["code"]} {r["name"]} <b>{r["score"]}</b> {d}</span>'
+
+    # ---- GLM 快速上升/下滑 ----
+    def glm_delta(code):
+        gs = glm_hist.get(code, [])
+        if len(gs) < 2: return 0
+        return int(gs[-1]) - int(gs[-2])
+
+    glm_risers = sorted([r for r in results if r.get("glm_score")], key=lambda r: glm_delta(r["code"]), reverse=True)[:5]
+    glm_fallers = sorted([r for r in results if r.get("glm_score")], key=lambda r: glm_delta(r["code"]))[:5]
+
+    glm_risers_summary = ""
+    for r in glm_risers:
+        d = glm_delta(r["code"])
+        glm_risers_summary += f'<span style="display:inline-block;margin:3px 6px 3px 0;padding:3px 10px;border-radius:8px;background:#dcfce7;font-size:12px;color:#166534;font-weight:600">{r["code"]} {r["name"]} <b>G{r.get("glm_score","?")}</b> +{d}</span>'
+
+    glm_fallers_summary = ""
+    for r in glm_fallers:
+        d = glm_delta(r["code"])
+        glm_fallers_summary += f'<span style="display:inline-block;margin:3px 6px 3px 0;padding:3px 10px;border-radius:8px;background:#fee2e2;font-size:12px;color:#dc2626;font-weight:600">{r["code"]} {r["name"]} <b>G{r.get("glm_score","?")}</b> {d}</span>'
 
     # ---- 完整HTML ----
     html = f"""<!DOCTYPE html>
@@ -1958,8 +1977,10 @@ function sortTable(col) {{
   <div class="summary">
     <div class="top5"><h3 style="color:#92400e">🔥 SS 最佳 TOP 5</h3>{top5_summary}</div>
     <div class="top5"><h3 style="color:#6b21a8">🧠 GLM 集成 TOP 5 (Sharpe 3.66)</h3>{glm_top5 or "<span style='color:#999;font-size:12px'>GLM 评分暂未生成</span>"}</div>
-    <div class="risers"><h3 style="color:#166534">🚀 快速上升 TOP 5</h3>{risers_summary}</div>
-    <div class="fallers"><h3 style="color:#dc2626">🔻 快速下滑 TOP 5</h3>{fallers_summary}</div>
+    <div class="risers"><h3 style="color:#166534">🚀 SS 快速上升 TOP 5</h3>{risers_summary}</div>
+    <div class="risers"><h3 style="color:#166534">🧬 GLM 快速上升 TOP 5</h3>{glm_risers_summary or "<span style='color:#999;font-size:12px'>-</span>"}</div>
+    <div class="fallers"><h3 style="color:#dc2626">🔻 SS 快速下滑 TOP 5</h3>{fallers_summary}</div>
+    <div class="fallers"><h3 style="color:#dc2626">⚠️ GLM 快速下滑 TOP 5</h3>{glm_fallers_summary or "<span style='color:#999;font-size:12px'>-</span>"}</div>
   </div>
   <div class="tab-bar">{tab_buttons_html}</div>
   {tab_panels_html}
