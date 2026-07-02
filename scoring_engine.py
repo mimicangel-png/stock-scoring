@@ -2532,19 +2532,15 @@ def run_daily_scoring(stock_codes, output_dir="/workspace", send_mail=True, reci
     for code, date_scores in hist_data.items():
         hist_scores[code] = [s for d, s in sorted(date_scores.items())]
     
-    # 保存历史评分
-    with open(hist_path, "w") as f: json.dump(hist_data, f, ensure_ascii=False)
-    
     # ==== 集成 GLM 评分（锦上添花） ====
     print(f"\n[GLM] 集成 GLM 评分中...")
     glm_scores = score_ensemble_glm(stock_codes, klines, extra, train_days=60)
-    glm_hist = {}  # {code: [score_list]} for GLM trend display
+    glm_hist = {}
     if glm_scores:
         for r in results:
             gs = glm_scores.get(r["code"])
             if gs is not None:
                 r["glm_score"] = gs
-                # Save GLM history (separate file)
                 code_glm_key = f"glm_{r['code']}"
                 if code_glm_key not in hist_data: hist_data[code_glm_key] = {}
                 hist_data[code_glm_key][today] = gs
@@ -2552,11 +2548,12 @@ def run_daily_scoring(stock_codes, output_dir="/workspace", send_mail=True, reci
         print(f"  GLM Top5: " + " | ".join(f"{r['code']} {r['name']}: G{r.get('glm_score','?')}" for r in glm_top))
     else:
         print(f"  ⚠️ GLM 训练数据不足，跳过")
-    # Convert GLM history for trend display
     for key, date_scores in hist_data.items():
         if key.startswith("glm_"):
-            code = key[4:]
-            glm_hist[code] = [s for d, s in sorted(date_scores.items())]
+            glm_hist[key[4:]] = [s for d, s in sorted(date_scores.items())]
+    
+    # 保存历史评分
+    with open(hist_path, "w") as f: json.dump(hist_data, f, ensure_ascii=False)
     
     print(f"\n[5/5] 生成报告...")
     sb=sum(1 for r in results if r["sug_action"]=="strong_buy")
