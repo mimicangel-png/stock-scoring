@@ -33,8 +33,6 @@ _load_env()
 
 # ========== 本地数据库缓存（可选，自动检测）==========
 try:
-    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                       ".workbuddy/skills/stock-db"))
     from stock_db import StockDB
     _db = StockDB()
     _USE_DB = True
