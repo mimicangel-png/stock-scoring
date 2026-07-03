@@ -7,7 +7,14 @@ __pycache__/
 *.pyo
 
 # 输出文件（每次运行生成，无需版本控制）
-output/
+output/*
+# 但保留历史数据文件（换设备需要）
+!output/icir_rank_history.json
+!output/icir_signal_history.json
+!output/icir_ss_history.json
+
+# v11 输出
+v11/output/
 
 # 历史评分数据
 ss_score_history.json
