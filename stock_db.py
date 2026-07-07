@@ -133,6 +133,16 @@ class StockDB:
         all_klines = {}
         missing = []
 
+        # 判断最新交易日（周末回退到周五）
+        now = datetime.now()
+        wd = now.weekday()  # 0=Mon ... 6=Sun
+        if wd == 5:  # Sat -> Fri
+            latest_td = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+        elif wd == 6:  # Sun -> Fri
+            latest_td = (now - timedelta(days=2)).strftime("%Y-%m-%d")
+        else:
+            latest_td = today
+
         # 1. 先从本地读
         with self._connect() as conn:
             for code in codes:
@@ -141,11 +151,21 @@ class StockDB:
                     (code,)
                 ).fetchall()
                 if len(rows) >= days:
-                    # 足够多，直接用缓存
-                    all_klines[code] = [
-                        {"date": r[0], "open": r[1], "high": r[2], "low": r[3], "close": r[4], "volume": r[5]}
-                        for r in rows[-days:]
-                    ]
+                    # 足够多，但需检查是否缺最新交易日
+                    last_date = rows[-1][0]
+                    if last_date >= latest_td:
+                        # 缓存已是最新，直接用
+                        all_klines[code] = [
+                            {"date": r[0], "open": r[1], "high": r[2], "low": r[3], "close": r[4], "volume": r[5]}
+                            for r in rows[-days:]
+                        ]
+                    else:
+                        # 缓存虽够130条，但缺最近交易日 → 增量抓取
+                        all_klines[code] = [
+                            {"date": r[0], "open": r[1], "high": r[2], "low": r[3], "close": r[4], "volume": r[5]}
+                            for r in rows
+                        ]
+                        missing.append(code)
                 elif len(rows) > 0:
                     # 有部分数据，记录最后日期
                     last_date = rows[-1][0]
@@ -496,6 +516,107 @@ class StockDB:
             conn.execute(
                 "UPDATE fetch_log SET retry_count=retry_count+1, updated_at=datetime('now') WHERE status='failed'"
             )
+
+    def force_refresh(self, codes):
+        """
+        强制重新拉取指定股票的 K线 + 实时行情（不走缓存）。
+        用于数据不完整时的重试补拉。
+        返回 (fetched_klines, fetched_extra) 各为成功拉取的 code set。
+        """
+        today = datetime.now().strftime("%Y-%m-%d")
+        fetched_k = set()
+        fetched_e = set()
+
+        if codes:
+            # 强制拉K线
+            dummy = {}
+            self._fetch_klines_batch(list(codes), 130, today, dummy)
+            # 检查哪些成功写入了今天的数据
+            with self._connect() as conn:
+                for c in codes:
+                    r = conn.execute(
+                        "SELECT 1 FROM klines WHERE code=? AND date>=? LIMIT 1",
+                        (c, today)
+                    ).fetchone()
+                    # K线可能今天没交易（停牌），看fetch_log是否ok
+                    log = conn.execute(
+                        "SELECT status FROM fetch_log WHERE code=? AND date=? AND data_type='klines' ORDER BY updated_at DESC LIMIT 1",
+                        (c, today)
+                    ).fetchone()
+                    if log and log[0] == "ok":
+                        fetched_k.add(c)
+
+            # 强制拉行情
+            self._fetch_extra_info_batch(list(codes), today)
+            with self._connect() as conn:
+                for c in codes:
+                    r = conn.execute(
+                        "SELECT 1 FROM extra_info WHERE code=? AND date=? LIMIT 1",
+                        (c, today)
+                    ).fetchone()
+                    if r:
+                        fetched_e.add(c)
+
+        return fetched_k, fetched_e
+
+    def check_data_freshness(self, codes):
+        """
+        检查所有股票的 K线 和 实时行情 是否为最新交易日数据。
+        返回 dict:
+          kline_latest: DB中K线最新日期
+          extra_latest: DB中实时行情最新日期
+          expected_td: 预期最新交易日（周末回退到周五）
+          missing_klines: 缺最新K线的 code 列表
+          missing_extra: 缺最新行情的 code 列表
+          kline_counts: {date: count} 最近5个K线日期分布
+          total_codes: 总股票数
+          fresh: bool 是否全部新鲜
+        """
+        now = datetime.now()
+        wd = now.weekday()
+        if wd == 5:
+            expected_td = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+        elif wd == 6:
+            expected_td = (now - timedelta(days=2)).strftime("%Y-%m-%d")
+        else:
+            expected_td = now.strftime("%Y-%m-%d")
+
+        with self._connect() as conn:
+            # K线最新日期
+            kline_latest = conn.execute("SELECT MAX(date) FROM klines").fetchone()[0] or "-"
+            # 实时行情最新日期
+            extra_latest = conn.execute("SELECT MAX(date) FROM extra_info").fetchone()[0] or "-"
+            # K线日期分布（最近5天）
+            rows = conn.execute(
+                "SELECT date, COUNT(DISTINCT code) FROM klines GROUP BY date ORDER BY date DESC LIMIT 5"
+            ).fetchall()
+            kline_counts = {r[0]: r[1] for r in rows}
+            # 缺最新K线的股票
+            missing_klines = [
+                c for c in codes
+                if conn.execute(
+                    "SELECT 1 FROM klines WHERE code=? AND date=? LIMIT 1", (c, kline_latest)
+                ).fetchone() is None
+            ]
+            # 缺最新行情的股票
+            missing_extra = [
+                c for c in codes
+                if conn.execute(
+                    "SELECT 1 FROM extra_info WHERE code=? AND date=? LIMIT 1", (c, extra_latest)
+                ).fetchone() is None
+            ]
+
+        fresh = (kline_latest >= expected_td) and len(missing_klines) == 0 and len(missing_extra) == 0
+        return {
+            "kline_latest": kline_latest,
+            "extra_latest": extra_latest,
+            "expected_td": expected_td,
+            "missing_klines": missing_klines,
+            "missing_extra": missing_extra,
+            "kline_counts": kline_counts,
+            "total_codes": len(codes),
+            "fresh": fresh,
+        }
 
     def stats(self):
         """打印缓存储量统计"""

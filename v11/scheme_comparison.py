@@ -30,7 +30,8 @@ from v11.data_builder import compute_forward_returns
 # ================================================================
 
 # ICIR来自第一次回测：ICIR > 0.05 的因子加权
-ICIR_WEIGHTS = {
+# v3.0: 原始权重
+ICIR_WEIGHTS_V3 = {
     "turnover_z":      0.451,   # strongest
     "log_mcap":        0.162,
     "mfi":             0.153,
@@ -65,9 +66,20 @@ ICIR_WEIGHTS = {
     "ocf_ratio_rank":  0.001,
 }
 
-# 归一化
-_total_w = sum(w for w in ICIR_WEIGHTS.values() if w > 0)
-ICIR_NORMALIZED = {k: v / _total_w for k, v in ICIR_WEIGHTS.items()}
+# v4.0: mfi/pct_52w 取反 (基于 GLM 方向矛盾诊断)
+ICIR_WEIGHTS_V4 = dict(ICIR_WEIGHTS_V3)
+ICIR_WEIGHTS_V4["mfi"] = -0.153
+ICIR_WEIGHTS_V4["pct_52w"] = -0.091
+
+# 兼容旧引用
+ICIR_WEIGHTS = ICIR_WEIGHTS_V3
+
+# 归一化 (v3 和 v4 各自归一化)
+_total_v3 = sum(abs(w) for w in ICIR_WEIGHTS_V3.values())
+ICIR_NORMALIZED_V3 = {k: v / _total_v3 for k, v in ICIR_WEIGHTS_V3.items()}
+_total_v4 = sum(abs(w) for w in ICIR_WEIGHTS_V4.values())
+ICIR_NORMALIZED_V4 = {k: v / _total_v4 for k, v in ICIR_WEIGHTS_V4.items()}
+ICIR_NORMALIZED = ICIR_NORMALIZED_V3  # 默认 v3
 
 
 # ================================================================
@@ -115,14 +127,16 @@ class EqualWeightScheme(ScoringScheme):
 
 class ICIRWeightedScheme(ScoringScheme):
     """ICIR 加权 (基于预标定的因子有效性)"""
-    name = "ICIR加权"
+    def __init__(self, weights_dict=None, name="ICIR加权"):
+        self.name = name
+        self.weights = weights_dict or ICIR_NORMALIZED
 
     def score(self, factor_values, active_factors):
         scores = {}
         for code, fvals in factor_values.items():
             weighted = 0
             for fname in active_factors:
-                w = ICIR_NORMALIZED.get(fname, 0.01)
+                w = self.weights.get(fname, 0.01)
                 weighted += w * fvals.get(fname, 0)
             scores[code] = weighted
         return _cross_sectional_normalize(scores)
@@ -283,7 +297,8 @@ def main():
     schemes = [
         GLMEnsembleScheme(),
         EqualWeightScheme(),
-        ICIRWeightedScheme(),
+        ICIRWeightedScheme(ICIR_NORMALIZED_V3, "ICIR-v3(原版)"),
+        ICIRWeightedScheme(ICIR_NORMALIZED_V4, "ICIR-v4(mfi反)"),
     ]
 
     results = []
