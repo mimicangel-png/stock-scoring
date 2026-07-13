@@ -623,7 +623,7 @@ def run_daily(codes_file=None, output_dir=None, recipient=None):
             print(f"  🔄 K线数据过期({kline_date} < {expected_td})，正在增量更新...")
 
     klines = _db.get_klines(codes, days=130)
-    extra = _db.get_extra_info(codes)
+    extra = _db.get_extra_info(codes, force_refresh=True)
     for c in extra: extra[c]["_sector"] = get_theme(c)
 
     # ====== 数据完整性自动重试（最多5轮）======

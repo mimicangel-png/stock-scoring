@@ -240,26 +240,34 @@ class StockDB:
     # Extra Info (实时快照)
     # ================================================================
 
-    def get_extra_info(self, codes):
-        """获取实时行情快照（按日期缓存，同一天不重复抓）"""
+    def get_extra_info(self, codes, force_refresh=False):
+        """获取实时行情快照
+
+        Args:
+            codes: 股票代码列表
+            force_refresh: True=强制重新抓取（同一天重跑时用），False=按日期缓存
+        """
         today = datetime.now().strftime("%Y-%m-%d")
         result = {}
         need_fetch = []
 
-        with self._connect() as conn:
-            for code in codes:
-                row = conn.execute(
-                    "SELECT name,price,change_pct,pe_ttm,pb,mcap,turnover,vol_ratio FROM extra_info WHERE code=? AND date=?",
-                    (code, today)
-                ).fetchone()
-                if row:
-                    result[code] = {
-                        "name": row[0], "price": row[1], "change_pct": row[2],
-                        "pe_ttm": row[3], "pb": row[4], "mcap": row[5],
-                        "turnover": row[6], "vol_ratio": row[7],
-                    }
-                else:
-                    need_fetch.append(code)
+        if force_refresh:
+            need_fetch = list(codes)
+        else:
+            with self._connect() as conn:
+                for code in codes:
+                    row = conn.execute(
+                        "SELECT name,price,change_pct,pe_ttm,pb,mcap,turnover,vol_ratio FROM extra_info WHERE code=? AND date=?",
+                        (code, today)
+                    ).fetchone()
+                    if row:
+                        result[code] = {
+                            "name": row[0], "price": row[1], "change_pct": row[2],
+                            "pe_ttm": row[3], "pb": row[4], "mcap": row[5],
+                            "turnover": row[6], "vol_ratio": row[7],
+                        }
+                    else:
+                        need_fetch.append(code)
 
         if need_fetch:
             fetched = self._fetch_extra_info_batch(need_fetch, today)
